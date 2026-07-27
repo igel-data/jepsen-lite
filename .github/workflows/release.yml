@@ -1,0 +1,74 @@
+name: Release
+
+# Tag a commit and push it, and that version goes to Clojars:
+#
+#     git tag v0.1.0 && git push origin v0.1.0
+#
+# The tag is the only place the version is written down; `build.clj` reads it
+# from VERSION, so there is nothing to bump in a file and nothing to keep in
+# step with the tag.
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+# Never two deploys of the same tag at once: Clojars does not accept a version
+# twice, so the second would fail halfway and tell you nothing useful.
+concurrency:
+  group: clojars-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Publish to Clojars
+    runs-on: ubuntu-latest
+    # Holds CLOJARS_USERNAME and CLOJARS_DEPLOY_TOKEN, and lets the deploy be
+    # gated on a review if you ever want that.
+    environment: clojars
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Setup Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Install Clojure CLI
+        uses: DeLaGuardo/setup-clojure@13
+        with:
+          cli: 1.12.5.1654
+
+      - name: Cache Clojure dependencies
+        uses: actions/cache@v6
+        with:
+          path: ~/.m2/repository
+          key: ${{ runner.os }}-release-m2-${{ hashFiles('**/deps.edn') }}
+          restore-keys: |
+            ${{ runner.os }}-release-m2-
+
+      - name: Set release version
+        run: |
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Expected a release tag such as v1.2.3 or v1.2.3-rc1, got $GITHUB_REF_NAME"
+            exit 1
+          fi
+          echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+
+      # Same gate as CI, because a tag is not a promise that main was green
+      # when it was cut -- and a bad release can't be taken back off Clojars.
+      - name: Test
+        run: clojure -M:test
+
+      - name: Build JAR
+        run: clojure -T:build jar
+
+      - name: Publish to Clojars
+        env:
+          CLOJARS_USERNAME: ${{ secrets.CLOJARS_USERNAME }}
+          CLOJARS_PASSWORD: ${{ secrets.CLOJARS_DEPLOY_TOKEN }}
+        run: clojure -T:build deploy
