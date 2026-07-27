@@ -15,6 +15,7 @@
             [lite.bridge :as bridge]
             [lite.nemesis :as nemesis]
             [lite.target]
+            [lite.target.http]
             [lite.target.in-process]
             [lite.workload :as workload]))
 

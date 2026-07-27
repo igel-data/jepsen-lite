@@ -9,6 +9,15 @@
   :run  {:extra-paths ["examples"]
          :main-opts   ["-m" "demo.kvs"]}
 
+  ;; The `:http` demo comes in two halves, in two terminals: the store, which
+  ;; runs outside Lite and knows nothing about it, and Lite connecting to it.
+  ;; Keeping them apart is the point -- an `:http` target is one Lite doesn't
+  ;; run, so nothing here lets Lite start one.
+  :serve    {:extra-paths ["examples"]
+             :main-opts   ["-m" "demo.http-server"]}
+  :run-http {:extra-paths ["examples"]
+             :main-opts   ["-m" "demo.http-kvs"]}
+
   ;; Note the absence of "examples": the test suite stands on its own, on
   ;; fixtures in test/. The demo is documentation, not a dependency of it.
   :test {:extra-paths ["test"]
