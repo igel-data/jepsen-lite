@@ -187,10 +187,19 @@
 ;; still answers the durability question, by catching reads that fall below the
 ;; increments the target acknowledged.
 
+;; The interval has to leave room for ops to *complete* between kills, not just
+;; to be issued. A restarting JVM takes a second or so on a laptop and rather
+;; longer on a shared CI runner, and ops issued into that window come back
+;; `:info` -- indeterminate, and so not writes the target ever promised to
+;; keep. Faults arriving faster than the target recovers produce a run in which
+;; nothing was acknowledged, which no durability checker can say anything
+;; about. The interval also delays the first fault (see `lite.nemesis`), so
+;; there is something acknowledged before the first kill lands.
+
 (def ^:private crash-opts
   {:nemesis      [:crash]
-   :time-limit   10
-   :nemesis-opts {:faults 3, :fault-interval 2}})
+   :time-limit   20
+   :nemesis-opts {:faults 3, :fault-interval 4}})
 
 (def durable-run
   (delay (with-data-dir
@@ -232,16 +241,63 @@
 (deftest a-store-that-fsyncs-survives-being-killed
   (is (true? (:valid? @durable-run))))
 
+(deftest a-buffered-write-does-not-survive-the-kill-that-follows-it
+  ;; The mechanism, without a nemesis schedule to race: acknowledge a write,
+  ;; kill -9, read. This is the assertion the end-to-end run below depends on,
+  ;; and the only one of the two that can't be defeated by a slow machine.
+  (with-data-dir
+    (fn [dir]
+      (let [port    (free-port)
+            url     (str "http://127.0.0.1:" port)
+            adapter (assoc (http-targets/map->HttpAdapter {:url url})
+                           :handler (:register http-targets/handlers))
+            conn    (target/build
+                     {:type    :local-process
+                      :command (driver-command port dir {:durability :buffered})
+                      :url     url
+                      :log     (str dir "/target.log")}
+                     adapter)
+            invoke  (fn [op] (client/invoke adapter (target/current conn) op))]
+        (target/start! conn)
+        (try
+          (target/acquire! conn)
+          (is (= :ok (:type (invoke {:type :invoke, :f :write
+                                     :key 0, :value 42})))
+              "the store acknowledged the write")
+
+          (local/crash! conn)
+
+          (testing "and then lost it, because it never left the store's memory"
+            (is (nil? (:value (invoke {:type :invoke, :f :read, :key 0})))))
+          (finally
+            (target/stop! conn)))))))
+
 (deftest a-store-that-buffers-acknowledged-writes-does-not
   ;; The bug SIGKILL can catch: acknowledged before it left the store's own
   ;; memory. The process dies with the buffer, and the increments the target
   ;; promised to keep are gone.
   (with-data-dir
     (fn [dir]
-      (let [{:keys [valid? results]}
+      (let [{:keys [valid? results history]}
             (core/run (config :counter (assoc crash-opts
                                               :data-dir dir
                                               :durability :buffered)))]
+        (testing "the run had something to lose in the first place"
+          ;; Check the premise before the conclusion. A run in which nothing
+          ;; was acknowledged before a kill cannot detect a store that loses
+          ;; acknowledged writes, and would otherwise report that as the store
+          ;; behaving -- which is how this test passed in CI while proving
+          ;; nothing. If this fails, the fault schedule is outrunning the
+          ;; target's recovery: raise :fault-interval.
+          (let [first-kill (:time (first (crashes history)))
+                acked      (filter (fn [op] (and (= :ok (:type op))
+                                                 (= :add (:f op))
+                                                 (< (:time op) first-kill)))
+                                   history)]
+            (is (some? first-kill) "the target was killed")
+            (is (seq acked)
+                "some add was acknowledged before the first kill")))
+
         (is (false? valid?))
         (testing "as reads below what the target acknowledged"
           (let [[lower value _upper] (first (:errors results))]

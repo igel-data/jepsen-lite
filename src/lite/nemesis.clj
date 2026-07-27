@@ -121,9 +121,25 @@
   [_test _ctx]
   {:type :info, :f :crash})
 
+(defn- lead-in
+  "Nothing happens for one interval, so that the run has something to lose.
+
+   `gen/stagger` spaces ops out but doesn't hold the first one back, so without
+   this the opening fault lands microseconds into the run, before a single
+   client op has completed. On a machine quick enough to get some ops
+   acknowledged between faults, that merely wastes the first fault. On a slow
+   one every op can still be in flight when the next fault arrives, and a run
+   can reach its end having never acknowledged anything at all -- and a
+   durability test containing no acknowledged writes passes while proving
+   nothing. That is exactly how this was found: green here, green in CI, and
+   meaningless in CI."
+  [interval faults]
+  (gen/phases (gen/sleep interval) faults))
+
 (defn- crash-generator
   [{:keys [crashes crash-interval] :or {crashes 5, crash-interval 1/5}}]
-  (gen/limit crashes (gen/stagger crash-interval crash-op)))
+  (lead-in crash-interval
+           (gen/limit crashes (gen/stagger crash-interval crash-op))))
 
 ;; ## :local-process
 ;;
@@ -170,7 +186,8 @@
    same limit -- so a short run simply gets fewer faults. Without one, the cap
    is what stops the nemesis running forever after the clients are done."
   [streams {:keys [faults fault-interval] :or {faults 5, fault-interval 1}}]
-  (gen/limit faults (gen/stagger fault-interval (gen/mix streams))))
+  (lead-in fault-interval
+           (gen/limit faults (gen/stagger fault-interval (gen/mix streams)))))
 
 (defn- local-process-generators
   "`:crash` restarts the target itself, so it is a single op. `:pause` has to
