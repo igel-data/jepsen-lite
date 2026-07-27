@@ -10,7 +10,9 @@
   (:require [clojure.string :as str]
             [jepsen.generator :as gen]
             [jepsen.nemesis :as jepsen.nemesis]
-            [lite.target.in-process :as in-process]))
+            [lite.target.compose :as compose]
+            [lite.target.in-process :as in-process]
+            [lite.target.local-process :as local-process]))
 
 (def validity
   "Which faults each target-type can inject. This table is the whole of Jepsen
@@ -123,6 +125,101 @@
   [{:keys [crashes crash-interval] :or {crashes 5, crash-interval 1/5}}]
   (gen/limit crashes (gen/stagger crash-interval crash-op)))
 
+;; ## :local-process
+;;
+;; The same two intents, against a target the operating system can be asked to
+;; do something about. `crash` is SIGKILL and a restart; `pause` is SIGSTOP,
+;; and the `:resume` that follows it is SIGCONT -- one intent, two ops, because
+;; unlike a crash a pause has to be undone.
+
+(defn- local-process-nemesis
+  [target]
+  (reify jepsen.nemesis/Nemesis
+    (setup! [this _test] this)
+
+    (invoke! [_this _test op]
+      (assoc op :value (case (:f op)
+                         ;; Which crash this was. Keep it a number: checkers
+                         ;; read every op in the history, and some are strict
+                         ;; about op values.
+                         :crash  (local-process/crash! target)
+                         :pause  (local-process/pause! target)
+                         :resume (local-process/resume! target))))
+
+    (teardown! [_this _test] nil)))
+
+(defn- fault-cycle
+  "The ops one round of the requested intents produces, in a fixed order.
+
+   Deterministic rather than mixed, so a run's faults don't interleave into
+   combinations nobody meant -- a crash landing between a pause and its resume
+   would leave the resume aimed at a process that no longer exists."
+  [intents {:keys [fault-interval pause-duration]
+            :or   {fault-interval 1, pause-duration 3}}]
+  (cond-> []
+    (some #{:crash} intents)
+    (conj (gen/sleep fault-interval) {:type :info, :f :crash})
+
+    (some #{:pause} intents)
+    (conj (gen/sleep fault-interval)
+          {:type :info, :f :pause}
+          ;; Long enough that ops actually meet the pause. If it were shorter
+          ;; than the client's request timeout, a pause would only slow ops
+          ;; down rather than leaving them indeterminate.
+          (gen/sleep pause-duration)
+          {:type :info, :f :resume})))
+
+(defn- rounds
+  "`faults` rounds of a fault cycle, each round applying every requested intent
+   once.
+
+   The limit is in ops, and a `gen/sleep` is an op like any other -- it is what
+   the nemesis worker does for those seconds -- so a round's worth of ops
+   includes its waits. Counting only the faults would silently deliver half the
+   ones that were asked for."
+  [round faults]
+  (gen/limit (* faults (count round)) (cycle round)))
+
+(defn- local-process-generator
+  [intents {:keys [faults] :or {faults 5} :as opts}]
+  (rounds (fault-cycle intents opts) faults))
+
+;; ## :compose
+;;
+;; Every intent, because a container is the first thing Lite owns that has a
+;; network interface of its own. Pumba does the work; `lite.target.compose`
+;; knows the command lines.
+;;
+;; Two of the three heal themselves: `pumba pause` and `pumba netem` take a
+;; duration and undo their own damage when it expires, so each is a single op
+;; where `:local-process`'s pause needed a matching resume. A killed container
+;; still has to be started again, and that stays Lite's job.
+
+(defn- compose-nemesis
+  [target]
+  (reify jepsen.nemesis/Nemesis
+    (setup! [this _test] this)
+
+    (invoke! [_this _test op]
+      (assoc op :value (case (:f op)
+                         :crash     (compose/crash! target)
+                         :pause     (compose/pause! target)
+                         :partition (compose/partition! target))))
+
+    (teardown! [_this _test] nil)))
+
+(defn- compose-generator
+  [intents {:keys [faults fault-interval] :or {faults 5, fault-interval 1}}]
+  ;; A fixed order, so a run's faults don't land in combinations nobody asked
+  ;; for. Every one of these heals itself except the crash, which `crash!`
+  ;; finishes by starting the container again -- so unlike `:local-process`,
+  ;; each intent is one op.
+  (rounds (into [] (mapcat (fn [intent]
+                             [(gen/sleep fault-interval)
+                              {:type :info, :f intent}]))
+                intents)
+          faults))
+
 (defn build
   "Returns `{:nemesis ..., :generator ...}` for the requested intents against
    this target, or nil if none were asked for. Intent -> implementation is
@@ -131,5 +228,9 @@
   (validate! target-type intents)
   (when (seq intents)
     (case target-type
-      :in-process {:nemesis   (crash-nemesis target)
-                   :generator (crash-generator opts)})))
+      :in-process    {:nemesis   (crash-nemesis target)
+                      :generator (crash-generator opts)}
+      :local-process {:nemesis   (local-process-nemesis target)
+                      :generator (local-process-generator intents opts)}
+      :compose       {:nemesis   (compose-nemesis target)
+                      :generator (compose-generator intents opts)})))

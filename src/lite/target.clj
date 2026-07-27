@@ -19,6 +19,25 @@
   (release! [this]
     "A worker is done with its client."))
 
+(defprotocol Lifecycle
+  "How a target-type that *owns* the target brings it up and takes it down
+   around a run. Only the target-types that run the target implement this:
+   `:in-process`'s instance is created by the adapter's `open`, and an `:http`
+   target was already running before Lite arrived and outlives it. A
+   `:local-process` or `:compose` target is Lite's to start and to stop, and
+   leaving one behind after a run would be a bug you'd only notice in `ps`."
+  (start! [this]
+    "Brings the target up and waits until it can serve. Called once, before
+     anything is generated or opened.")
+  (stop! [this]
+    "Takes it down again. Called once, after the run, however the run ended."))
+
+;; The target-types that own nothing get these for free, so `lite.core` can
+;; call start!/stop! without asking which kind of target it has.
+(extend-protocol Lifecycle
+  Object (start! [_this] nil) (stop! [_this] nil)
+  nil    (start! [_this] nil) (stop! [_this] nil))
+
 (def target-types
   "Every target-type in the design. Only those with a `build` method are
    runnable; the rest arrive in later milestones."

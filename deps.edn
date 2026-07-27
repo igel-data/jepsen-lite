@@ -18,6 +18,16 @@
   :run-http {:extra-paths ["examples"]
              :main-opts   ["-m" "demo.http-kvs"]}
 
+  ;; The `:local-process` demo needs only one terminal: Lite starts the same
+  ;; store itself, as a program it can kill.
+  :run-local {:extra-paths ["examples"]
+              :main-opts   ["-m" "demo.local-kvs"]}
+
+  ;; The store in a container, where the faults include partition. Needs
+  ;; Docker running; Lite brings the service up and down around the run.
+  :run-compose {:extra-paths ["examples"]
+                :main-opts   ["-m" "demo.compose-kvs"]}
+
   ;; Note the absence of "examples": the test suite stands on its own, on
   ;; fixtures in test/. The demo is documentation, not a dependency of it.
   :test {:extra-paths ["test"]

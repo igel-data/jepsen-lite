@@ -13,6 +13,8 @@ pom.xml.asc
 .nrepl-port
 .cpcache/
 /store/
+# Where the :local-process demos keep the target data and log.
+/local-target/
 .clj-kondo/.cache/
 .lsp/
 

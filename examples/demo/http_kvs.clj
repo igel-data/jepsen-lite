@@ -144,7 +144,7 @@
   [conn {:keys [f value]}]
   (case f
     :add  (post conn "/append" {:key :elements, :element value})
-    :read (or (post conn "/read" {:key :elements}) [])))
+    :read (or (post conn "/read-collection" {:key :elements}) [])))
 
 (defn- counter-handler
   [conn {:keys [f value]}]

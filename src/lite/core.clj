@@ -15,8 +15,10 @@
             [lite.bridge :as bridge]
             [lite.nemesis :as nemesis]
             [lite.target]
+            [lite.target.compose]
             [lite.target.http]
             [lite.target.in-process]
+            [lite.target.local-process]
             [lite.workload :as workload]))
 
 (def default-nodes
@@ -110,7 +112,13 @@
                                (if nem
                                  (gen/nemesis (:generator nem) client-gen)
                                  client-gen))
-            :checker         (:checker w)}
+            :checker         (:checker w)
+            ;; `run` needs the target itself, not just the client wrapped
+            ;; around it, to start and stop it around the run. It holds the
+            ;; user's adapter, so like every other live object in the test map
+            ;; it must be kept out of what gets written to the store.
+            :lite/target     conn
+            :nonserializable-keys #{:lite/target}}
            (when nem {:nemesis (:nemesis nem)}))))
 
 (defn- realize-history
@@ -133,8 +141,12 @@
                                         ; the workload's op count
       :name          \"...\"            ; optional
       :target        {:type :in-process} ; optional; :in-process is the default
+                                        ; see lite.target.<type> for its config
       :nemesis       [:crash]           ; optional; faults to inject
-      :nemesis-opts  {...}}             ; optional; :crashes, :crash-interval
+      :nemesis-opts  {...}}             ; optional; :in-process takes :crashes
+                                        ; and :crash-interval, the others
+                                        ; :faults, :fault-interval and
+                                        ; :pause-duration
 
    Interprets the workload's generator against the user's adapter -- with the
    nemesis, if any, perturbing the target as it goes -- checks the resulting
@@ -144,22 +156,32 @@
    `prepare-test` supplies the `:start-time`/`:concurrency`/`:barrier` the
    interpreter needs and makes the generator forgettable; the store handle has
    to be open for the interpreter's history writer, and stays open through
-   analysis so the checker's results land next to the history."
+   analysis so the checker's results land next to the history.
+
+   A target-type that runs the target -- `:local-process`, `:compose` -- starts
+   it here and stops it in the `finally`, whatever the run did. The ones that
+   don't own a target no-op."
   [config]
   (validate! config)
-  (let [test (jepsen/prepare-test (test-map config))
-        test (store/with-handle [test test]
-               ;; save-0! writes the initial test; the history writer refuses to
-               ;; open without the block id it leaves in the test's metadata.
-               (let [test (store/save-0! test)
-                     test (util/with-relative-time
-                            (store/with-history! [test test]
-                              (interpreter/run! test)))]
-                 (-> test
-                     (update :history realize-history)
-                     store/save-1!
-                     ;; Runs the checker and writes the results out.
-                     jepsen/analyze!)))
+  (let [test    (jepsen/prepare-test (test-map config))
+        target  (:lite/target test)
+        _       (lite.target/start! target)
+        test    (try
+                  (store/with-handle [test test]
+                    ;; save-0! writes the initial test; the history writer
+                    ;; refuses to open without the block id it leaves in the
+                    ;; test's metadata.
+                    (let [test (store/save-0! test)
+                          test (util/with-relative-time
+                                 (store/with-history! [test test]
+                                   (interpreter/run! test)))]
+                      (-> test
+                          (update :history realize-history)
+                          store/save-1!
+                          ;; Runs the checker and writes the results out.
+                          jepsen/analyze!)))
+                  (finally
+                    (lite.target/stop! target)))
         results (:results test)]
     (println "\nVerdict:")
     (pprint/pprint results)

@@ -12,12 +12,13 @@ Two orthogonal axes:
 2. **target-type** — `:in-process` / `:local-process` / `:http` / `:compose`;
    the deploy / lifecycle method, which decides what faults can be injected.
 
-## Status: M5
+## Status: M6 — v1 complete
 
 The pipeline runs end to end: a workload's generator → the user's ClientAdapter
 (bridged to `jepsen.client/Client` internally) → a `jepsen.history` → the
-workload's checker → a verdict. All four v1 workloads are in, and they run
-against both runnable target-types — in-process and over HTTP:
+workload's checker → a verdict. All four v1 workloads are in, and all four
+target-types run them — in-process, over HTTP, as an OS process Lite kills, and
+as a container Lite can cut off the network:
 
 | `:workload` | Checks | Needs from the target |
 |---|---|---|
@@ -45,6 +46,19 @@ Lite doesn't run:
     clojure -M:run-http bank broken    # ... which the same checkers catch
     clojure -M:run-http set crash      # refused: see Faults, below
 
+And against a store Lite runs itself, as a process it can `kill -9` — one
+terminal, because there is nobody else to start it:
+
+    clojure -M:run-local counter              # no faults
+    clojure -M:run-local counter crash        # kill -9, restart, recover
+    clojure -M:run-local counter crash unsafe # a store that buffers -> caught
+    clojure -M:run-local set pause            # SIGSTOP / SIGCONT
+
+    clojure -M:run-compose set partition      # in a container (needs Docker)
+
+Same store, same handlers, same checkers throughout. What changes between those
+four blocks is the `:target`.
+
 ## How long, and how many workers
 
     (lite.core/run {..., :time-limit 10, :concurrency 8})
@@ -63,24 +77,53 @@ of the group size, and says so if given something else.
 The target-type is the second axis: how the target is deployed, and so what its
 connection lifecycle looks like and which faults it can be given.
 
-    :target {:type :in-process}                          ; runs inside Lite's JVM
-    :target {:type :http, :url "http://127.0.0.1:8080"}  ; already running, elsewhere
+    :target {:type :in-process}
+    :target {:type :http,      :url "http://127.0.0.1:8080"}
+    :target {:type :local-process, :command ["my-server" "--port" "8080"]
+                                   :url "http://127.0.0.1:8080"}
+    :target {:type :compose,   :file "docker-compose.yml"
+                               :container "my-store", :url "http://127.0.0.1:8080"}
 
-`:in-process` owns the target's whole lifecycle: one instance, shared by every
-worker, which the crash nemesis can destroy and re-create. `:http` owns nothing.
-The target is a program somebody else started; Lite opens a connection per
-worker and does no more. Starting, stopping and preparing an `:http` target is
-yours to do — Lite will only say plainly, before the run rather than op by op,
-when nothing is listening where you said it would be.
+The pattern behind the whole axis is one sentence: **a fault is possible where
+Lite owns the thing the fault happens to.**
+
+| | Lite owns | so it can |
+|---|---|---|
+| `:in-process` | an object in its own JVM | destroy and rebuild it |
+| `:http` | nothing — the target was already running | connect, and nothing else |
+| `:local-process` | an OS process it started | `kill -9` it, `SIGSTOP` it |
+| `:compose` | a container, with a network interface of its own | all of that, and cut it off |
 
 Everything else is shared: the same `:workload` values, the same handler
-contracts, the same checkers, the same verdict. Adding `:http` (M5) took a
-target-type lifecycle, one line registering it, and a demo server; the
+contracts, the same checkers, the same verdict. Each new target-type has cost a
+file under `src/lite/target/`, a line registering it, and an example — the
 ClientAdapter protocol, the workloads, the bridge, the exception→`:type`
-wrapper and the checker/store path were not touched. HTTP errors need no new
-code either — a rejected op and a refused connection are `fail!`, a timeout is
-`info!`, through the wrapper that was already there. That orthogonality is the
-bet the design made in M0, and testing it is what M5 was for.
+wrapper and the checker/store path have not been touched since M4.5. Wire
+errors need no new code either: a rejected op and a refused connection are
+`fail!`, a timeout or a connection dropped mid-request is `info!`, through the
+wrapper that was already there. That orthogonality was the bet the design made
+in M0, and M5 and M6 are what tested it.
+
+## What a `crash` actually tests
+
+It depends on what Lite is holding, and it is worth being exact about, because
+a crash test that proves less than you think is worse than none:
+
+- **`:in-process`** — `close` then `open`. A clean shutdown and recovery. It
+  exercises a target's recovery path, and not the process boundary at all.
+- **`:local-process` / `:compose`** — a real `SIGKILL`. No flush, no close, no
+  shutdown hook, then a real restart that has to find its data on disk. This
+  catches a store that acknowledged writes it was still holding in **its own
+  memory**, which is a real and common bug.
+
+Neither tests the loss of writes the store handed to the kernel but never
+`fsync`ed: SIGKILL kills the process, not the page cache. That needs power loss
+or a filesystem fault injector, and is post-v1.
+
+**`open` attaches to durable state; it must not create or reset it.** That
+holds at every level — an object, a data directory, a container volume. A
+target that came back empty after a crash would be passing the test by
+forgetting the question.
 
 ## Faults
 
@@ -95,28 +138,72 @@ possible depends on how the target is deployed, not on the workload:
 | `:compose` | ✓ | ✓ | ✓ |
 
 Asking for one of the ✗ combinations stops the run before it starts, with what
-went wrong, why, and what to do instead. `:in-process` and `:http` are runnable
-so far; `:http`'s whole row is ✗, because Lite doesn't run that target and so
-has nothing to crash, pause or cut off.
+went wrong, why, and what to do instead. Every row is live. `:http`'s is all ✗
+because Lite doesn't run that target and so has nothing to crash, pause or cut
+off, and `:local-process` can't be partitioned because it reaches Lite over
+loopback — there is no network in between to cut.
 
-`:in-process`'s crash destroys the target instance and creates a new one —
-`close` then `open` — which is what `ClientAdapter`'s re-runnable lifecycle is
-for. **`open` attaches to durable state; it must not create or reset it.** A
-store that persists therefore survives a crash with its committed data intact, and the
-checker passes. When acknowledged writes go missing afterwards, that's a
-durability bug in the target, and the checker says so. Lite doesn't decide what
-should survive — it crashes the target, records what happened, and lets the
-checker rule.
+How each is carried out:
+
+| intent | `:in-process` | `:local-process` | `:compose` |
+|---|---|---|---|
+| `:crash` | `close` then `open` | `SIGKILL`, then restart | `pumba kill`, then `up -d` |
+| `:pause` | — | `SIGSTOP` / `SIGCONT` | `pumba pause --duration` |
+| `:partition` | — | — | `pumba netem loss 100%` |
+
+Pumba runs as a container with the docker socket mounted, so there is nothing
+to install beyond Docker. `netem` needs `tc`, which a target's own image is
+unlikely to carry, so Lite passes `--tc-image` — without it the fault silently
+does nothing, which is worse than failing, because the run would look like a
+partition test that passed.
+
+Lite doesn't decide what should survive a fault — it perturbs the target,
+records what happened, and lets the checker rule. When acknowledged writes go
+missing afterwards, that's a durability bug in the target, and the checker says
+so.
+
+Ops that land while a target is down are recorded by the outcome contract that
+was already there, and the distinction matters to the verdict: a refused
+connection is a **`:fail`** (the request certainly never arrived), while a
+timeout or a connection dropped mid-request is an **`:info`** — nobody knows,
+and a checker that was told otherwise would be being lied to.
 
 Whatever initial state a workload needs, the workload writes itself, through the
 same handler as every other op — `:bank` opens its accounts with an `:init` op
 in a first generator phase. Adapters stay workload-agnostic, and initialization
 doesn't silently re-run on every crash.
 
+## Verifying a real store
+
+The reason the project exists: point a lightweight harness at a persistent
+key-value store and `kill -9` it, to find out whether what it acknowledged is
+still there afterwards.
+
+[IgelDB](https://github.com/igel-data/igeldb) is verified this way, from its
+own repository — see `jepsen/` there. Being embedded, it needs a small driver
+process to be killable at all; that driver, and the adapter that talks to it,
+live with IgelDB rather than here, which is the right way round: a target's
+integration is the target's business, and jepsen-lite has no dependency on
+anything it tests.
+
+    clojure -M:jepsen set kill    # in the igeldb repo
+
+A recent run: **1958 acknowledged writes, none lost, across five SIGKILLs** —
+plus eight writes that came back `:info` because the connection died
+mid-request and turned out to have been committed, which the checker reports as
+`recovered` rather than as errors. That is what the indeterminate outcome is
+*for*.
+
+## Layout
+
 The library is `src/`. The demo targets live in `examples/`, on the classpath
-only for the `:run` / `:serve` / `:run-http` aliases, so depending on
-jepsen-lite doesn't drag them in — and they use nothing a consumer couldn't.
-The test suite has its own fixtures in `test/` and never reads `examples/`.
+only for the demo aliases (`:run`, `:serve`, `:run-http`, `:run-local`,
+`:run-compose`), so depending on jepsen-lite doesn't drag them in — and they
+use nothing a consumer couldn't. The test suite has its own fixtures in `test/`
+and never reads `examples/`.
+
+    clojure -M:test                                   # everything but Docker
+    JEPSEN_LITE_DOCKER=1 clojure -M:test -n lite.compose-docker-test
 
 A user writes a **ClientAdapter**, a **handler**, and picks a `:workload`;
 `lite.core/run` returns `{:valid? ..., :results ..., :history ...}`. Each

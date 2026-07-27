@@ -58,8 +58,14 @@
       (is (= :unusable-target-type (:lite/error (ex-data e))))))
 
   (testing "a target-type in the design but not implemented yet"
+    ;; There is no longer one to try: M6 made the last of them runnable, so
+    ;; every target-type in `target/target-types` now has a `build` method.
+    ;; What remains is the guard for the next one somebody adds to the list
+    ;; before implementing it.
     (let [e (is (thrown? clojure.lang.ExceptionInfo
-                         (core/validate! {:target {:type :compose}})))]
+                         (with-redefs [target/target-types
+                                       (conj target/target-types :teleport)]
+                           (core/validate! {:target {:type :teleport}}))))]
       (is (= :unusable-target-type (:lite/error (ex-data e))))
       (is (str/includes? (ex-message e) "isn't implemented yet")))))
 

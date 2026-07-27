@@ -1,0 +1,48 @@
+# The `:compose` demo target: the same HTTP KVS, in a container.
+#
+#   clojure -M:run-compose counter            # no faults
+#   clojure -M:run-compose counter crash      # SIGKILL the container
+#   clojure -M:run-compose counter partition  # cut it off the network
+#
+# Lite runs `docker compose up -d` and `down -v` around the run itself; you
+# only need to run it by hand to look at it:
+#
+#   docker compose -f examples/compose/docker-compose.yml up -d
+#   docker compose -f examples/compose/docker-compose.yml logs -f
+
+services:
+  kvs:
+    build:
+      # The image needs src/ and examples/, so the build context is the repo.
+      context: ../..
+      dockerfile: examples/compose/Dockerfile
+    # Named explicitly: Pumba aims at a container by name, and a fault injector
+    # that guessed the project prefix wrong would perturb nothing at all.
+    container_name: jepsen-lite-kvs
+    ports:
+      - "8080:8080"
+    volumes:
+      # The store's data outlives the container, which is what makes killing it
+      # a question worth asking.
+      - kvs-data:/data
+    # How Lite knows the store is ready. It matters more than it looks: Docker
+    # binds the host side of a published port as soon as the container exists,
+    # so `127.0.0.1:8080` accepts connections -- and drops them -- while the
+    # JVM inside is still starting. Lite runs `up -d --wait`, which waits for
+    # this to pass, so ops don't start until the store can serve them.
+    #
+    # Checked from inside the container, where there is no port proxy to fool
+    # it, using bash's /dev/tcp rather than a tool the image may not have.
+    healthcheck:
+      test: ["CMD-SHELL", "timeout 1 bash -c '</dev/tcp/127.0.0.1/8080'"]
+      interval: 1s
+      timeout: 2s
+      retries: 60
+      start_period: 2s
+    # Deliberately absent: a `restart:` policy. Lite starts the container again
+    # itself after a kill, so that the moment it comes back is a moment Lite
+    # knows about and can wait for.
+    restart: "no"
+
+volumes:
+  kvs-data:
