@@ -155,8 +155,17 @@
 (deftest a-durability-bug-is-caught
   ;; A store that acknowledges writes before they are durable: the defect crash
   ;; testing exists to find, standing in for a missing fsync or an unflushed WAL.
-  (let [{:keys [valid? results]} (core/run (targets/config :set {:nemesis [:crash]
-                                                                 :durability :buggy}))]
+  ;;
+  ;; On a clock, with the crashes spread across it. The default schedule fires
+  ;; all eight within about fifteen milliseconds, which can be over before the
+  ;; workers have opened their clients -- and crashes that all land before the
+  ;; first write cost a store nothing, so the run would find no bug because
+  ;; there was none to find. That is a flaky test, not a lenient one.
+  (let [{:keys [valid? results]}
+        (core/run (assoc (targets/config :set {:nemesis    [:crash]
+                                               :durability :buggy})
+                         :time-limit   1/2
+                         :nemesis-opts {:crashes 8, :crash-interval 1/20}))]
     (is (false? valid?))
     (testing "as lost writes, not as an error"
       (is (pos? (:lost-count results)))

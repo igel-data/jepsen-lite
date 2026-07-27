@@ -100,18 +100,30 @@
             :concurrency     concurrency
             :client          (cond-> (bridge/client adapter conn)
                                (:wrap-client w) ((:wrap-client w)))
-            :generator       (let [client-gen
-                                   (cond-> (cond->> (:generator w)
-                                             time-limit (gen/time-limit
-                                                         time-limit))
-                                     ;; Whatever the workload needs to do once
-                                     ;; the ops are over -- a final read, say --
-                                     ;; happens after the clock stops.
-                                     (:final-generator w)
-                                     (gen/phases (:final-generator w)))]
-                               (if nem
-                                 (gen/nemesis (:generator nem) client-gen)
-                                 client-gen))
+            :generator       (gen/phases
+                              ;; One clock over both. The nemesis has to be
+                              ;; inside the time limit, not beside it: a fault
+                              ;; schedule that outlived the clients would keep
+                              ;; a `:time-limit 5` run going for as long as it
+                              ;; had faults left to inject.
+                              (cond->> (:generator w)
+                                nem        (gen/nemesis (:generator nem))
+                                time-limit (gen/time-limit time-limit))
+
+                              ;; Then undo whatever is still in force. A run
+                              ;; that stopped mid-pause or mid-partition would
+                              ;; otherwise take its closing reads against a
+                              ;; target that can't answer.
+                              (when (:final-generator nem)
+                                (gen/nemesis (:final-generator nem)))
+
+                              ;; And only now whatever the workload has to do
+                              ;; last -- `:set`'s read of everything it added.
+                              ;; It has to come after every fault, or it
+                              ;; verifies a target the last faults never
+                              ;; touched.
+                              (when (:final-generator w)
+                                (gen/clients (:final-generator w))))
             :checker         (:checker w)
             ;; `run` needs the target itself, not just the client wrapped
             ;; around it, to start and stop it around the run. It holds the
@@ -145,8 +157,8 @@
       :nemesis       [:crash]           ; optional; faults to inject
       :nemesis-opts  {...}}             ; optional; :in-process takes :crashes
                                         ; and :crash-interval, the others
-                                        ; :faults, :fault-interval and
-                                        ; :pause-duration
+                                        ; :faults (a cap) and :fault-interval;
+                                        ; :compose also :fault-duration
 
    Interprets the workload's generator against the user's adapter -- with the
    nemesis, if any, perturbing the target as it goes -- checks the resulting

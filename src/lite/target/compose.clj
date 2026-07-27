@@ -200,7 +200,13 @@
     (wait-ready! config "restarting it")
     (let [fresh     (client/open adapter)
           [stale _] (reset-vals! conn fresh)]
-      (when stale (client/close adapter stale)))
+      ;; Off this thread: closing a connection to the container that just died
+      ;; waits for its in-flight requests to time out, and the fault shouldn't
+      ;; be charged for that.
+      (when stale
+        (doto (Thread. ^Runnable #(client/close adapter stale))
+          (.setDaemon true)
+          (.start))))
     (let [n (swap! crashes inc)]
       (info "Killed the target container and started it again"
             (str "(" n " so far)"))

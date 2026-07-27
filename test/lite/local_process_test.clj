@@ -297,8 +297,13 @@
                                :request-timeout (Duration/ofMillis 500)
                                :nemesis         [:pause]
                                :time-limit      10
-                               :nemesis-opts    {:faults 2, :fault-interval 1
-                                                 :pause-duration 2}}))
+                               ;; A pause lasts until its resume, and the two
+                               ;; alternate at the fault interval -- so the
+                               ;; interval is how long the target stays stopped,
+                               ;; and it wants to be longer than the client's
+                               ;; request timeout above or a pause would only
+                               ;; slow ops down rather than leave them unknown.
+                               :nemesis-opts    {:faults 4, :fault-interval 2}}))
             paused (filter (comp #{:pause} :f) history)]
         (is (seq paused))
         (is (seq (filter (comp #{:resume} :f) history)))

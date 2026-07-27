@@ -193,6 +193,19 @@
     ;; A worker letting go of its client doesn't take the process down with it.
     nil))
 
+(defn- release-later!
+  "Closes a connection to the target that just died, out of the way.
+
+   Closing one can block: a client with requests in flight to a process that no
+   longer exists waits for each of them to time out first. Doing that on the
+   nemesis's thread makes every crash cost a request timeout, which is how a
+   five-second run ends up taking half a minute -- and the connection being
+   closed is the dead one, which nobody is going to use again either way."
+  [adapter conn]
+  (doto (Thread. ^Runnable #(client/close adapter conn))
+    (.setDaemon true)
+    (.start)))
+
 (defn crash!
   "A real crash: SIGKILL, then start it again.
 
@@ -217,7 +230,7 @@
         (wait-ready! proc config)
         (let [fresh      (client/open adapter)
               [stale _]  (reset-vals! conn fresh)]
-          (when stale (client/close adapter stale)))
+          (when stale (release-later! adapter stale)))
         (let [n (swap! crashes inc)]
           (info "Killed the target and started it again"
                 (str "(" n " so far; pid " (when old (.pid old)) " -> "

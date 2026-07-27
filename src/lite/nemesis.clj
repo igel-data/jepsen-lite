@@ -148,41 +148,45 @@
 
     (teardown! [_this _test] nil)))
 
-(defn- fault-cycle
-  "The ops one round of the requested intents produces, in a fixed order.
+(defn- ops
+  "An endless stream of one kind of fault op.
 
-   Deterministic rather than mixed, so a run's faults don't interleave into
-   combinations nobody meant -- a crash landing between a pause and its resume
-   would leave the resume aimed at a process that no longer exists."
-  [intents {:keys [fault-interval pause-duration]
-            :or   {fault-interval 1, pause-duration 3}}]
-  (cond-> []
-    (some #{:crash} intents)
-    (conj (gen/sleep fault-interval) {:type :info, :f :crash})
+   A bare map is a generator of exactly *one* op, which is why these are built
+   with `gen/repeat` -- and why the pairs below flip-flop between two streams
+   rather than between two maps."
+  [f]
+  (gen/repeat {:type :info, :f f}))
 
-    (some #{:pause} intents)
-    (conj (gen/sleep fault-interval)
-          {:type :info, :f :pause}
-          ;; Long enough that ops actually meet the pause. If it were shorter
-          ;; than the client's request timeout, a pause would only slow ops
-          ;; down rather than leaving them indeterminate.
-          (gen/sleep pause-duration)
-          {:type :info, :f :resume})))
+(defn- schedule
+  "Turns fault streams into the thing a nemesis actually runs.
 
-(defn- rounds
-  "`faults` rounds of a fault cycle, each round applying every requested intent
-   once.
+   `gen/stagger` spaces the ops out rather than emitting sleeps between them,
+   which is why `gen/limit` can be trusted here: it counts faults, and there is
+   nothing else in the stream to count. (An earlier hand-rolled cycle of
+   [sleep, fault, sleep, fault] made `:faults 2` deliver one.)
 
-   The limit is in ops, and a `gen/sleep` is an op like any other -- it is what
-   the nemesis worker does for those seconds -- so a round's worth of ops
-   includes its waits. Counting only the faults would silently deliver half the
-   ones that were asked for."
-  [round faults]
-  (gen/limit (* faults (count round)) (cycle round)))
+   The limit is a cap, not a schedule. With a `:time-limit` the run ends when
+   the clock does -- `lite.core` puts the clients and the nemesis under the
+   same limit -- so a short run simply gets fewer faults. Without one, the cap
+   is what stops the nemesis running forever after the clients are done."
+  [streams {:keys [faults fault-interval] :or {faults 5, fault-interval 1}}]
+  (gen/limit faults (gen/stagger fault-interval (gen/mix streams))))
 
-(defn- local-process-generator
-  [intents {:keys [faults] :or {faults 5} :as opts}]
-  (rounds (fault-cycle intents opts) faults))
+(defn- local-process-generators
+  "`:crash` restarts the target itself, so it is a single op. `:pause` has to
+   be undone, so it alternates with `:resume`, and the final generator resumes
+   once more at the end -- otherwise a run whose clock expires mid-pause would
+   take its closing reads against a target that is still stopped.
+
+   `resume!` is a no-op on a target that isn't paused, so the extra one at the
+   end is free, and so is a crash landing between a pause and its resume."
+  [intents opts]
+  (let [pausing? (boolean (some #{:pause} intents))
+        streams  (cond-> []
+                   (some #{:crash} intents) (conj (ops :crash))
+                   pausing? (conj (gen/flip-flop (ops :pause) (ops :resume))))]
+    {:generator       (schedule streams opts)
+     :final-generator (when pausing? {:type :info, :f :resume})}))
 
 ;; ## :compose
 ;;
@@ -208,29 +212,41 @@
 
     (teardown! [_this _test] nil)))
 
-(defn- compose-generator
-  [intents {:keys [faults fault-interval] :or {faults 5, fault-interval 1}}]
-  ;; A fixed order, so a run's faults don't land in combinations nobody asked
-  ;; for. Every one of these heals itself except the crash, which `crash!`
-  ;; finishes by starting the container again -- so unlike `:local-process`,
-  ;; each intent is one op.
-  (rounds (into [] (mapcat (fn [intent]
-                             [(gen/sleep fault-interval)
-                              {:type :info, :f intent}]))
-                intents)
-          faults))
+(defn- compose-generators
+  "Each intent is a single op here: `pumba pause` and `pumba netem` take a
+   duration and undo their own damage when it expires, and a killed container
+   is restarted by `crash!` itself.
+
+   That self-healing is also why the final generator is a wait rather than an
+   op. A fault injected just before the clock runs out is still in force when
+   it does, and nothing Lite can send will lift it early -- so the run waits it
+   out before taking its closing reads."
+  [intents {:keys [fault-duration] :or {fault-duration 5} :as opts}]
+  {:generator       (schedule (mapv ops intents) opts)
+   :final-generator (gen/sleep fault-duration)})
 
 (defn build
-  "Returns `{:nemesis ..., :generator ...}` for the requested intents against
-   this target, or nil if none were asked for. Intent -> implementation is
-   dispatched here and nowhere else; later target-types add a branch."
+  "Returns a nemesis package for the requested intents against this target, or
+   nil if none were asked for:
+
+     :nemesis          carries the ops out
+     :generator        the faults to inject during the run
+     :final-generator  what to do at the end so the run doesn't finish with a
+                       fault still in force -- `lite.core` runs this after the
+                       clients stop and before the workload's closing reads
+
+   Intent -> implementation is dispatched here and nowhere else; later
+   target-types add a branch."
   [target-type target {:keys [intents] :as opts}]
   (validate! target-type intents)
   (when (seq intents)
-    (case target-type
-      :in-process    {:nemesis   (crash-nemesis target)
-                      :generator (crash-generator opts)}
-      :local-process {:nemesis   (local-process-nemesis target)
-                      :generator (local-process-generator intents opts)}
-      :compose       {:nemesis   (compose-nemesis target)
-                      :generator (compose-generator intents opts)})))
+    (merge
+     (case target-type
+       :in-process    {:nemesis (crash-nemesis target)}
+       :local-process {:nemesis (local-process-nemesis target)}
+       :compose       {:nemesis (compose-nemesis target)})
+     (case target-type
+       ;; An in-process crash is synchronous and leaves nothing to undo.
+       :in-process    {:generator (crash-generator opts)}
+       :local-process (local-process-generators intents opts)
+       :compose       (compose-generators intents opts)))))
