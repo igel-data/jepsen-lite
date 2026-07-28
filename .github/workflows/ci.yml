@@ -54,7 +54,7 @@ jobs:
           clj-kondo: latest
 
       - name: Check formatting
-        run: cljfmt check src test examples
+        run: cljfmt check src test examples build.clj
 
       - name: Lint
-        run: clj-kondo --lint src test examples
+        run: clj-kondo --lint src test examples build.clj

@@ -1,3 +1,5 @@
+[![Jepsen Lite](https://img.shields.io/clojars/v/com.igel-data/jepsen-lite.svg)](https://clojars.org/com.igel-data/jepsen-lite)
+
 # Jepsen Lite
 
 A lightweight, scoped-down fault-injection / verification tool built on Jepsen's internals (generator / checker / history / store), with SSH, multi-node clusters, and the full Jepsen lifecycle hidden behind a minimal surface.
