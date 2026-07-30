@@ -1,0 +1,34 @@
+{:paths ["src"]
+
+ ;; LMDB and nothing else: the driver is a program in its own right, and it must
+ ;; be runnable -- and killable -- without jepsen-lite anywhere near it.
+ ;;
+ ;; lmdbjava is a JNR-FFI binding, not a bundled library: it needs a system
+ ;; liblmdb, which `lmdb.native` locates. See the README.
+ :deps {org.clojure/clojure {:mvn/version "1.12.5"}
+        org.lmdbjava/lmdbjava {:mvn/version "0.9.3"}}
+
+ ;; lmdbjava reaches into java.nio's internals to hand LMDB direct buffer
+ ;; addresses without copying, which the module system closes off by default.
+ ;; Anything that opens an Env needs these -- including the driver, which is
+ ;; started as a fresh JVM and inherits nothing from the run that starts it, so
+ ;; `lmdb.runner` repeats them on its command line.
+ :aliases
+ {:jepsen {:extra-deps {com.igel-data/jepsen-lite
+                        ;; The working copy two directories up, not a release:
+                        ;; a case lives in the repo it exercises, so a change to
+                        ;; Jepsen Lite is under test the moment it is made. It
+                        ;; stays a dependency, declared here and not in Jepsen
+                        ;; Lite's own deps.edn -- the arrow points this way
+                        ;; round, and the library depends on nothing it tests.
+                        {:local/root "../.."}}
+           :jvm-opts   ["--add-opens" "java.base/java.nio=ALL-UNNAMED"
+                        "--add-opens" "java.base/sun.nio.ch=ALL-UNNAMED"]
+           :main-opts  ["-m" "lmdb.runner"]}
+
+  ;; The HTTP driver on its own, to poke at by hand. `clojure -M:jepsen` starts
+  ;; and kills one of these itself, on the classpath of the run.
+  :driver {:extra-deps {org.slf4j/slf4j-simple {:mvn/version "2.0.17"}}
+           :jvm-opts   ["--add-opens" "java.base/java.nio=ALL-UNNAMED"
+                        "--add-opens" "java.base/sun.nio.ch=ALL-UNNAMED"]
+           :main-opts  ["-m" "lmdb.driver"]}}}

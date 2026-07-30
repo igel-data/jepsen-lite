@@ -157,6 +157,18 @@ The rule in general: **power-off tests durability only if the target is
 configured to fsync.** The interesting result is a store that *claims*
 durability and still loses an acknowledged write.
 
+Neither of those two bullets is advice taken on trust; both are measured, in
+`cases/`. SQLite at `synchronous=OFF` loses over 1200 of some 1600 acknowledged
+writes to a power-off and **not one** to a `kill`. LMDB with `MDB_NOSYNC` is
+worse than losing them: in four runs of five the environment could not be
+reopened at all — `MDB_INVALID` — and again a `kill` costs it nothing. Set to
+sync, both come through every fault whole.
+
+That contrast is also the argument that this fault does what it says. A pair of
+real stores that fail a power-off exactly when they are configured not to sync,
+and pass it exactly when they are, is better evidence than any test in `test/`
+can be.
+
 **`open` attaches to durable state; it must not create or reset it.** That
 holds at every level — an object, a data directory, a container volume. A
 target that came back empty after a crash would be passing the test by
@@ -234,13 +246,16 @@ mid-request and turned out to have been committed, which the checker reports as
 `recovered` rather than as errors. That is what the indeterminate outcome is
 *for*.
 
+Other cases for real stores like SQLite are in `cases/`.
+
 ## Layout
 
 The library is `src/`. The demo targets live in `examples/`, on the classpath
 only for the demo aliases (`:run`, `:serve`, `:run-http`, `:run-local`,
 `:run-compose`), so depending on jepsen-lite doesn't drag them in — and they
-use nothing a consumer couldn't. The test suite has its own fixtures in `test/`
-and never reads `examples/`.
+use nothing a consumer couldn't. `cases/` is off this classpath altogether: a
+project and a `deps.edn` of its own per store. The test suite has its own
+fixtures in `test/` and never reads `examples/`.
 
     clojure -M:test                                   # everything but Docker
     JEPSEN_LITE_DOCKER=1 clojure -M:test -n lite.compose-docker-test

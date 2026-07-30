@@ -12,9 +12,10 @@ pom.xml.asc
 .lein-failures
 .nrepl-port
 .cpcache/
-/store/
+store/
 # Where the :local-process demos keep the target data and log.
 /local-target/
-.clj-kondo/.cache/
+jepsen-data/
+.clj-kondo/
 .lsp/
 

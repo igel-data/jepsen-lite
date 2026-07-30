@@ -1,0 +1,24 @@
+{:paths ["src"]
+
+ ;; SQLite and nothing else: the driver is a program in its own right, and it
+ ;; must be runnable -- and killable -- without jepsen-lite anywhere near it.
+ :deps {org.clojure/clojure    {:mvn/version "1.12.5"}
+        org.xerial/sqlite-jdbc {:mvn/version "3.53.2.1"}}
+
+ :aliases
+ {;; The verification runs. jepsen-lite drags in all of Jepsen, so it stays off
+  ;; the main deps. Run: clojure -M:jepsen [workload...] [crash] [pause]
+  :jepsen {:extra-deps {com.igel-data/jepsen-lite
+                        ;; The working copy two directories up, not a release:
+                        ;; a case lives in the repo it exercises, so a change to
+                        ;; Jepsen Lite is under test the moment it is made. It
+                        ;; stays a dependency, declared here and not in Jepsen
+                        ;; Lite's own deps.edn -- the arrow points this way
+                        ;; round, and the library depends on nothing it tests.
+                        {:local/root "../.."}}
+           :main-opts  ["-m" "sqlite.runner"]}
+
+  ;; The HTTP driver on its own, to poke at by hand. `clojure -M:jepsen` starts
+  ;; and kills one of these itself, on the classpath of the run.
+  :driver {:extra-deps {org.slf4j/slf4j-simple {:mvn/version "2.0.17"}}
+           :main-opts  ["-m" "sqlite.driver"]}}}
