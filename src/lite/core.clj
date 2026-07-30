@@ -36,7 +36,13 @@
   [{:keys [target nemesis]}]
   (let [target (or target default-target)]
     (lite.target/validate! target)
-    (nemesis/validate! (:type target) nemesis))
+    ;; Two questions in order. First: can a target of this kind be given these
+    ;; faults at all -- the axis-2 table, the same answer on every machine.
+    ;; Then: can *this* machine carry them out, which is where a power-off asks
+    ;; for Linux and FUSE. Answering them the other way round would tell a user
+    ;; their host is wrong about a fault their target-type could never do.
+    (nemesis/validate! (:type target) nemesis)
+    (lite.target/verify-faults! target nemesis))
   nil)
 
 (defn- check-concurrency!

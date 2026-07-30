@@ -106,7 +106,7 @@ errors need no new code either: a rejected op and a refused connection are
 wrapper that was already there. That orthogonality was the bet the design made
 in M0, and M5 and M6 are what tested it.
 
-## What a `crash` actually tests
+## What a `crash` actually tests — and what `power-off` does
 
 It depends on what Lite is holding, and it is worth being exact about, because
 a crash test that proves less than you think is worse than none:
@@ -118,9 +118,44 @@ a crash test that proves less than you think is worse than none:
   catches a store that acknowledged writes it was still holding in **its own
   memory**, which is a real and common bug.
 
-Neither tests the loss of writes the store handed to the kernel but never
-`fsync`ed: SIGKILL kills the process, not the page cache. That needs power loss
-or a filesystem fault injector, and is post-v1.
+None of them tests `fsync`. SIGKILL kills the process, not the kernel, so
+writes the store handed to the OS get written back anyway — a store that
+fsyncs what it acknowledges and one that merely `write()`s it come through a
+crash test identically.
+
+**`:power-off`** is the fault that asks. Lite mounts the target's data
+directory on [lazyfs](https://github.com/dsrhaslab/lazyfs), which holds writes
+in a cache of its own until an explicit fsync; each power-off clears that cache
+— waiting for lazyfs to confirm — and *then* SIGKILLs, so the restarted target
+recovers from a disk that lost precisely what it never synced.
+
+The demo shows the difference in three lines. The same store, one fault apart:
+
+    clojure -M:run-local counter power-off          # fsyncs      -> :valid? true
+    clojure -M:run-local counter power-off nofsync  # doesn't     -> :valid? false
+    clojure -M:run-local counter crash    nofsync   # same store  -> :valid? true
+
+`:power-off` is `:local-process` only and **Linux only** — lazyfs is FUSE. On
+any other host, asking for it stops the run with what's missing and how to fix
+it. It is never quietly downgraded to a plain crash, because that would report
+durability nobody tested.
+
+    JEPSEN_LITE_LAZYFS=/path/to/lazyfs/lazyfs clojure -M:run-local counter power-off
+
+### It only means something if the target actually fsyncs
+
+A store configured not to sync will "fail" a power-off trivially, and that
+result says nothing at all. Before reading a failure as a finding, check:
+
+- **SQLite** — needs `PRAGMA synchronous=FULL` (with a journal mode to match).
+  At `OFF` or `NORMAL` it may skip or reduce fsync, and losing data is then the
+  documented behaviour, not a bug.
+- **LMDB** — must not be opened with `MDB_NOSYNC` or `MDB_NOMETASYNC`; mind
+  what `MDB_WRITEMAP` implies too.
+
+The rule in general: **power-off tests durability only if the target is
+configured to fsync.** The interesting result is a store that *claims*
+durability and still loses an acknowledged write.
 
 **`open` attaches to durable state; it must not create or reset it.** That
 holds at every level — an object, a data directory, a container volume. A
@@ -132,18 +167,20 @@ forgetting the question.
 Faults are asked for by intent — `:nemesis [:crash]` — and which ones are
 possible depends on how the target is deployed, not on the workload:
 
-| target-type | `:crash` | `:pause` | `:partition` |
-|---|---|---|---|
-| `:http` | ✗ | ✗ | ✗ |
-| `:in-process` | ✓ | ✗ | ✗ |
-| `:local-process` | ✓ | ✓ | ✗ |
-| `:compose` | ✓ | ✓ | ✓ |
+| target-type | `:crash` | `:pause` | `:partition` | `:power-off` |
+|---|---|---|---|---|
+| `:http` | ✗ | ✗ | ✗ | ✗ |
+| `:in-process` | ✓ | ✗ | ✗ | ✗ |
+| `:local-process` | ✓ | ✓ | ✗ | ✓ |
+| `:compose` | ✓ | ✓ | ✓ | ✗ |
 
 Asking for one of the ✗ combinations stops the run before it starts, with what
-went wrong, why, and what to do instead. Every row is live. `:http`'s is all ✗
-because Lite doesn't run that target and so has nothing to crash, pause or cut
-off, and `:local-process` can't be partitioned because it reaches Lite over
-loopback — there is no network in between to cut.
+went wrong, why, and what to do instead. `:http`'s row is all ✗ because Lite
+doesn't run that target and so has nothing to crash, pause or cut off;
+`:local-process` can't be partitioned because it reaches Lite over loopback —
+there is no network in between to cut; and `:compose` can't be powered off
+because a FUSE mount inside a container needs capabilities Lite doesn't ask
+for yet. That last one is deferred rather than impossible.
 
 How each is carried out:
 
@@ -152,6 +189,7 @@ How each is carried out:
 | `:crash` | `close` then `open` | `SIGKILL`, then restart | `pumba kill`, then `up -d` |
 | `:pause` | — | `SIGSTOP` / `SIGCONT` | `pumba pause --duration` |
 | `:partition` | — | — | `pumba netem loss 100%` |
+| `:power-off` | — | lazyfs `clear-cache`, then `SIGKILL` | — |
 
 Pumba runs as a container with the docker socket mounted, so there is nothing
 to install beyond Docker. `netem` needs `tc`, which a target's own image is

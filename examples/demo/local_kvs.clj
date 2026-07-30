@@ -10,6 +10,12 @@
      clojure -M:run-local set pause            # SIGSTOP / SIGCONT
      clojure -M:run-local bank time=20 concurrency=8
 
+   And, on Linux with lazyfs, the fault a kill -9 can't be:
+
+     clojure -M:run-local counter power-off            # fsyncs -> survives
+     clojure -M:run-local counter power-off nofsync    # doesn't -> caught
+     clojure -M:run-local counter crash    nofsync     # ... and passes this
+
    Read this next to `demo/http_kvs.clj`. The adapter is the same one. The
    handlers are the same ones -- this namespace doesn't define any, it uses
    `demo.http-kvs`'s. The store on the other end is the same program. The only
@@ -17,19 +23,29 @@
    fault the operating system carries out:
 
      :http           Lite connects.                       No faults.
-     :local-process  Lite starts it and holds the handle. kill -9, SIGSTOP.
+     :local-process  Lite starts it and holds the handle. kill -9, SIGSTOP,
+                     and -- with a lazyfs mount under the data directory --
+                     power-off.
 
-   ## What `crash` here does and doesn't prove
+   ## What each fault proves, and what it doesn't
 
-   It is a real SIGKILL: no flush, no close, no shutdown hook, followed by a
-   real restart that has to find its data on disk. That tests process death and
+   `crash` is a real SIGKILL: no flush, no close, no shutdown hook, followed by
+   a real restart that has to find its data on disk. It tests process death and
    recovery, and it catches a store that acknowledged writes it was still
-   holding in its own memory -- which is what `unsafe` above simulates.
+   holding in its own memory -- which is what `unsafe` simulates.
 
-   It does *not* test the loss of writes the store handed to the kernel but
-   never fsynced: SIGKILL kills the process, not the page cache. Testing that
-   needs power loss or a filesystem fault injector, and is a milestone for
-   another day. Don't claim more of it than it tests."
+   What it cannot test is fsync. SIGKILL kills the process, not the kernel, so
+   writes the store handed to the OS are written back anyway. `nofsync` is a
+   store with exactly that flaw, and it passes `crash` every time.
+
+   `power-off` is the one that asks. lazyfs holds writes until an fsync, so
+   clearing its cache drops precisely what the store never synced. Run the last
+   two lines above together: the same store, one fault apart, and only one of
+   them tells the truth about it.
+
+   Needs Linux, /dev/fuse and a built lazyfs -- point `JEPSEN_LITE_LAZYFS` (or
+   `lazyfs=`) at the checkout. Anywhere else, Lite says so and stops rather
+   than quietly running a plain crash instead."
   (:require [clojure.java.io :as io]
             [clojure.string :as str]
             [demo.http-kvs :as http-kvs]
@@ -88,67 +104,92 @@
      :time-limit  how many seconds to run for
      :concurrency how many workers to run"
   ([workload] (config workload {}))
-  ([workload {:keys [data-dir nemesis nemesis-opts time-limit concurrency]
+  ([workload {:keys [data-dir nemesis nemesis-opts time-limit concurrency
+                     lazyfs-dir]
               :as   opts}]
    (let [handler  (get http-kvs/handlers workload)
          _        (assert handler (str "No handler for workload "
                                        (pr-str workload)))
          port     (free-port)
          url      (str "http://127.0.0.1:" port)
-         data-dir (or data-dir (str "local-target" File/separator (name workload)))]
+         base     (or data-dir (str "local-target" File/separator (name workload)))
+         ;; With a power-off, the store's data directory has to *be* the lazyfs
+         ;; mount -- that is the only place lazyfs can see its writes, and a
+         ;; target writing anywhere else would sail through every power-off
+         ;; without dropping a thing.
+         powering-off? (boolean (some #{:power-off} nemesis))
+         data-dir (if powering-off? (str base File/separator "data") base)]
      ;; A fresh directory per run. Note that this is the *demo's* doing, before
      ;; the run, and not the target-type's: Lite starts and kills this process,
      ;; but what it starts it on is the user's business -- and a crash test
      ;; means nothing if the data it is meant to recover was never there, or if
      ;; what it recovers turns out to be the last run's.
-     (rm-rf data-dir)
+     (rm-rf base)
      (.mkdirs (io/file data-dir))
      (cond-> {:adapter  (http-kvs/map->Adapter {:url url})
               :handler  handler
               :workload workload
               :name     (str "jepsen-lite-demo-local-" (name workload))
-              :target   {:type    :local-process
-                         :command (command port data-dir opts)
-                         :url     url
-                         :log     (str data-dir File/separator "target.log")}}
+              :target   (cond-> {:type    :local-process
+                                 :command (command port data-dir opts)
+                                 :url     url
+                                 :log     (str base File/separator "target.log")}
+                          powering-off?
+                          (assoc :lazyfs
+                                 {:dir         (or lazyfs-dir
+                                                   (System/getenv "JEPSEN_LITE_LAZYFS"))
+                                  :mount-point data-dir
+                                  :root        (str base File/separator "root")}))}
        time-limit   (assoc :time-limit time-limit)
        concurrency  (assoc :concurrency concurrency)
        nemesis      (assoc :nemesis nemesis)
        nemesis-opts (assoc :nemesis-opts nemesis-opts)))))
 
 (defn- parse-args
-  "Words in any order: a workload name, any of crash / pause / unsafe, and
-   settings as key=value, e.g. time=20 concurrency=8."
+  "Words in any order: a workload name, any of crash / pause / power-off /
+   unsafe / nofsync, and settings as key=value, e.g. time=20 concurrency=8."
   [args]
   (let [flags    (set (remove #(str/includes? % "=") args))
         settings (into {} (map #(str/split % #"=" 2))
                        (filter #(str/includes? % "=") args))
         number   (fn [k] (some-> (get settings k) parse-long))
         intents  (cond-> []
-                   (flags "crash") (conj :crash)
-                   (flags "pause") (conj :pause))]
+                   (flags "crash")     (conj :crash)
+                   (flags "power-off") (conj :power-off)
+                   (flags "pause")     (conj :pause))]
     [(or (first (filter (comp flags name) (keys http-kvs/handlers))) :counter)
      (cond-> {}
        ;; A store that acknowledges writes it is still holding in its own
        ;; memory. The bug a kill -9 exists to find.
        (flags "unsafe")       (assoc :durability :buffered)
+       ;; And one that hands them to the OS but never fsyncs: durable-looking
+       ;; under every crash test, and gone the moment the power does.
+       (flags "nofsync")      (assoc :durability :no-fsync)
        (seq intents)          (assoc :nemesis intents)
        (get settings "dir")   (assoc :data-dir (get settings "dir"))
+       (get settings "lazyfs") (assoc :lazyfs-dir (get settings "lazyfs"))
        (number "time")        (assoc :time-limit (number "time"))
        (number "concurrency") (assoc :concurrency (number "concurrency"))
        ;; Restarting a process takes about a second, so a run needs a clock to
        ;; run against or the faults land after the workload has finished.
        (and (seq intents) (not (number "time")))
-       (assoc :time-limit 15))]))
+       (assoc :time-limit 20))]))
 
 (defn- expected-valid?
-  "What a well-wired Lite should say: only a store that loses what it
-   acknowledged, when it is killed, should come back invalid."
+  "What a well-wired Lite should say. Which fault catches which store is the
+   whole point:
+
+     :buffered  loses acknowledged writes to any kill, so a crash catches it
+     :no-fsync  survives a kill -- the kernel writes its page cache back --
+                and loses them to a power-off, which is the only fault that
+                can tell the two apart"
   [{:keys [durability nemesis]}]
-  (not (and (seq nemesis) (= :buffered durability))))
+  (let [faults (set nemesis)]
+    (not (or (and (seq faults) (= :buffered durability))
+             (and (faults :power-off) (= :no-fsync durability))))))
 
 (defn -main
-  "`clojure -M:run-local [workload] [crash] [pause] [unsafe]
+  "`clojure -M:run-local [workload] [crash] [power-off] [pause] [unsafe]\n   [nofsync]
    [time=s] [concurrency=n] [dir=path]`
 
    Exits non-zero if the verdict isn't the one the demo is meant to produce,

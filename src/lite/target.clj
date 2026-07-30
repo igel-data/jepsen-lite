@@ -64,3 +64,15 @@
   [target]
   (when-not (contains? (methods build) (:type target))
     (build target nil)))
+
+(defmulti verify-faults!
+  "Can *this host* actually inject these faults into this target?
+
+   Separate from the axis-2 table, and asked after it. The table answers
+   whether a fault makes sense for a target-type at all -- a question with the
+   same answer everywhere. This asks whether the machine in front of us can
+   carry it out: `:power-off` needs Linux and FUSE, which is a property of the
+   host, not of the design. A target-type with nothing to check says nothing."
+  (fn [target _intents] (:type target)))
+
+(defmethod verify-faults! :default [_target _intents] nil)

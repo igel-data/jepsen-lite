@@ -139,17 +139,20 @@
 ;; ## Persistence
 ;;
 ;; A log of what changed, appended before the change is visible and replayed at
-;; startup. Two durabilities, and the difference between them is the whole
-;; question a `kill -9` asks:
+;; startup. Three durabilities, and which fault can catch which is the point:
 ;;
 ;;   :durable   flush and fsync before acknowledging. What was acknowledged is
-;;              on disk, so it survives.
-;;   :buffered  acknowledge first and let the writer's buffer flush when it
-;;              feels like it. This is a real bug class -- a store keeping
-;;              acknowledged writes in its own memory -- and it is one SIGKILL
-;;              can catch: the buffer dies with the process. (Writes that
-;;              reached the *kernel* unfsynced would survive a SIGKILL; losing
-;;              those needs power loss, or a filesystem fault injector.)
+;;              on disk. Survives both a kill -9 and a power-off.
+;;   :no-fsync  flush to the operating system, but never fsync. Survives a
+;;              kill -9 -- the kernel writes the page cache back regardless,
+;;              which is exactly why SIGKILL cannot test fsync -- and is lost
+;;              to a power-off, which drops what was never synced.
+;;   :buffered  acknowledge first and let the writer's own buffer flush when it
+;;              feels like it. The buffer dies with the process, so even a
+;;              kill -9 catches this one.
+;;
+;; The middle one is the interesting target: a store that looks durable under
+;; every crash test anyone runs, and isn't.
 
 (defn- open-log!
   [dir durability]
@@ -165,8 +168,11 @@
   [{:keys [^BufferedWriter writer ^FileOutputStream stream durability]} entry]
   (.write writer ^String (pr-str entry))
   (.write writer "\n")
+  ;; Handing the bytes to the OS is not the same as putting them on the disk,
+  ;; and the difference is invisible until the power goes.
+  (when (contains? #{:durable :no-fsync} durability)
+    (.flush writer))
   (when (= :durable durability)
-    (.flush writer)
     (.sync (.getFD stream))))
 
 (defn- replay
@@ -269,7 +275,8 @@
      :port        0 (default) for any free one
      :data-dir    where to keep the log; omitted means the store is in memory
                   only and a restart comes back empty
-     :durability  :durable (default) or :buffered -- see Persistence, above"
+     :durability  :durable (default), :no-fsync or :buffered -- see
+                  Persistence, above"
   ([] (server {}))
   ([{:keys [variant port data-dir durability]
      :or   {variant :correct, port 0, durability :durable}}]

@@ -163,13 +163,14 @@
 ;; question a `kill -9` asks:
 ;;
 ;;   :durable   flush and fsync before acknowledging. What was acknowledged is
-;;              on disk, so it survives.
-;;   :buffered  acknowledge first, and let the writer's buffer flush when it
-;;              feels like it. This is a real bug class -- a store keeping
-;;              acknowledged writes in its own memory -- and it is one SIGKILL
-;;              can catch: the buffer dies with the process. (Writes that
-;;              reached the *kernel* unfsynced would survive a SIGKILL; losing
-;;              those needs power loss, or a filesystem fault injector.)
+;;              on disk. Survives both a kill -9 and a power-off.
+;;   :no-fsync  flush to the operating system, but never fsync. Survives a
+;;              kill -9 -- the kernel writes the page cache back regardless,
+;;              which is why SIGKILL cannot test fsync -- and is lost to a
+;;              power-off, which drops what was never synced.
+;;   :buffered  acknowledge first, and let the writer's own buffer flush when
+;;              it feels like it. The buffer dies with the process, so even a
+;;              kill -9 catches this one.
 
 (defn- open-log!
   [dir durability]
@@ -185,8 +186,11 @@
   [{:keys [^BufferedWriter writer ^FileOutputStream stream durability]} entry]
   (.write writer ^String (pr-str entry))
   (.write writer "\n")
+  ;; Handing the bytes to the OS is not the same as putting them on the disk,
+  ;; and the difference is invisible until the power goes.
+  (when (contains? #{:durable :no-fsync} durability)
+    (.flush writer))
   (when (= :durable durability)
-    (.flush writer)
     (.sync (.getFD stream))))
 
 (defn- replay
@@ -372,15 +376,23 @@
   (let [[settings flags] (parse-args args)
         variant  (if (or (flags "broken") (= "broken" (settings "variant")))
                    :broken :correct)
+        durability (cond
+                     (or (flags "buffered")
+                         (= "buffered" (settings "durability")))  :buffered
+                     (or (flags "nofsync")
+                         (= "no-fsync" (settings "durability")))  :no-fsync
+                     :else                                        :durable)
         {:keys [url]}
         (server {:port       (parse-long (or (settings "port") "8080"))
                  :host       (or (settings "host") "127.0.0.1")
                  :data-dir   (or (settings "dir") (settings "data-dir"))
                  :variant    variant
-                 :durability (if (or (flags "buffered")
-                                     (= "buffered" (settings "durability")))
-                               :buffered :durable)})]
-    (println (str "kvs (" (name variant) ") listening on " url))
+                 :durability durability})]
+    ;; Both of them, because a run's meaning depends on the durability as much
+    ;; as on the variant -- and a silently-ignored flag is how a power-off test
+    ;; ends up quietly measuring a store that fsyncs everything.
+    (println (str "kvs (" (name variant) ", " (name durability)
+                  ") listening on " url))
     (println (str "Point Lite at it:  clojure -M:run-http register url=" url))
     (flush)
     @(promise)))

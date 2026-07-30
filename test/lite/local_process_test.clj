@@ -36,7 +36,7 @@
 ;; namespace's -main. Lite neither knows nor cares that the program it is about
 ;; to kill happens to be written in the same language.
 
-(defn- free-port []
+(defn free-port []
   (with-open [socket (ServerSocket. 0)]
     (.getLocalPort socket)))
 
@@ -44,12 +44,12 @@
   (str (Files/createTempDirectory "jepsen-lite-target"
                                   (into-array FileAttribute []))))
 
-(defn- rm-rf [f]
+(defn rm-rf [f]
   (let [f (io/file f)]
     (when (.isDirectory f) (run! rm-rf (.listFiles f)))
     (.delete f)))
 
-(defn- driver-command
+(defn driver-command
   [port data-dir {:keys [variant durability] :or {variant :correct
                                                   durability :durable}}]
   [(str (System/getProperty "java.home") File/separator "bin"

@@ -18,14 +18,16 @@
   "Which faults each target-type can inject. This table is the whole of Jepsen
    Lite's static validation, and the only authority on the question -- later
    target-types enable their row here, and nothing else needs to change."
-  {:http          {:crash false, :pause false, :partition false}
-   :in-process    {:crash true,  :pause false, :partition false}
-   :local-process {:crash true,  :pause true,  :partition false}
-   :compose       {:crash true,  :pause true,  :partition true}})
+  {:http          {:crash false, :pause false, :partition false, :power-off false}
+   :in-process    {:crash true,  :pause false, :partition false, :power-off false}
+   :local-process {:crash true,  :pause true,  :partition false, :power-off true}
+   ;; Power-off needs FUSE inside the container, which is a capabilities
+   ;; exercise nobody has done yet. False until it is, rather than half-true.
+   :compose       {:crash true,  :pause true,  :partition true,  :power-off false}})
 
 (def intents
   "Every fault a user can ask for."
-  [:crash :pause :partition])
+  [:crash :pause :partition :power-off])
 
 (def ^:private limits
   "Why a target-type can't do more than it can."
@@ -45,7 +47,32 @@
         "and there is no network to partition.")
 
    :compose
-   "a :compose target supports every fault."})
+   "a :compose target supports every fault except power-off."})
+
+(def ^:private intent-limits
+  "Why one particular fault is impossible somewhere, for the cases where the
+   target-type's general limitation isn't the real reason.
+
+   `:power-off` is the case: it isn't about signals or networks at all. It
+   drops the writes a target never fsynced, which takes a filesystem Lite
+   controls underneath the target's data directory."
+  {:power-off
+   {:in-process
+    (str "power-off drops the writes a target never fsynced, which needs a "
+         "filesystem under the target's data directory that Lite controls. An "
+         ":in-process target shares Lite's own JVM and its filesystem, so "
+         "there is no boundary to put one under.")
+
+    :http
+    (str "power-off drops the writes a target never fsynced, which needs a "
+         "filesystem under the target's data directory that Lite controls. Lite "
+         "doesn't run an :http target and may not even share a machine with it.")
+
+    :compose
+    (str "power-off drops the writes a target never fsynced, which needs a "
+         "filesystem Lite controls under the target's data directory, and "
+         "mounting one inside a container needs FUSE capabilities that Lite "
+         "doesn't ask for yet.")}})
 
 (defn- allowed
   "The intents this target-type can inject."
@@ -69,7 +96,8 @@
   (let [ok        (allowed target-type)
         elsewhere (remove #{target-type} (targets-supporting intent))]
     (str target-type " targets can't inject " intent ".\n\n"
-         "  why: " (get limits target-type) "\n\n"
+         "  why: " (or (get-in intent-limits [intent target-type])
+                       (get limits target-type)) "\n\n"
          "  fix: "
          (if (seq ok)
            (str "ask for " (str/join " or " ok) " instead")
@@ -158,9 +186,10 @@
                          ;; Which crash this was. Keep it a number: checkers
                          ;; read every op in the history, and some are strict
                          ;; about op values.
-                         :crash  (local-process/crash! target)
-                         :pause  (local-process/pause! target)
-                         :resume (local-process/resume! target))))
+                         :crash     (local-process/crash! target)
+                         :power-off (local-process/power-off! target)
+                         :pause     (local-process/pause! target)
+                         :resume    (local-process/resume! target))))
 
     (teardown! [_this _test] nil)))
 
@@ -190,17 +219,19 @@
            (gen/limit faults (gen/stagger fault-interval (gen/mix streams)))))
 
 (defn- local-process-generators
-  "`:crash` restarts the target itself, so it is a single op. `:pause` has to
-   be undone, so it alternates with `:resume`, and the final generator resumes
-   once more at the end -- otherwise a run whose clock expires mid-pause would
-   take its closing reads against a target that is still stopped.
+  "`:crash` and `:power-off` each restart the target themselves, so each is a
+   single op. `:pause` has to be undone, so it alternates with `:resume`, and
+   the final generator resumes once more at the end -- otherwise a run whose
+   clock expires mid-pause would take its closing reads against a target that
+   is still stopped.
 
    `resume!` is a no-op on a target that isn't paused, so the extra one at the
    end is free, and so is a crash landing between a pause and its resume."
   [intents opts]
   (let [pausing? (boolean (some #{:pause} intents))
         streams  (cond-> []
-                   (some #{:crash} intents) (conj (ops :crash))
+                   (some #{:crash} intents)     (conj (ops :crash))
+                   (some #{:power-off} intents) (conj (ops :power-off))
                    pausing? (conj (gen/flip-flop (ops :pause) (ops :resume))))]
     {:generator       (schedule streams opts)
      :final-generator (when pausing? {:type :info, :f :resume})}))

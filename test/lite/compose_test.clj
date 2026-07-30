@@ -82,14 +82,29 @@
 
 ;; ## Axis 2: the row that completes the table
 
-(deftest compose-accepts-every-fault
-  (doseq [intent nemesis/intents]
+(def ^:private container-faults
+  "Everything a container can be done to. `:power-off` is the exception, and
+   deliberately so: it needs a FUSE mount under the target's data directory,
+   which needs capabilities Lite doesn't ask a container for yet."
+  [:crash :pause :partition])
+
+(deftest compose-accepts-every-fault-that-happens-to-a-container
+  (doseq [intent container-faults]
     (testing intent
       (is (true? (get-in nemesis/validity [:compose intent])))
       (is (= [intent] (nemesis/validate! :compose [intent])))))
 
   (testing "including all of them at once"
-    (is (= nemesis/intents (nemesis/validate! :compose nemesis/intents)))))
+    (is (= container-faults (nemesis/validate! :compose container-faults))))
+
+  (testing "but not power-off, which is deferred rather than impossible"
+    (is (false? (get-in nemesis/validity [:compose :power-off])))
+    (let [e (is (thrown? clojure.lang.ExceptionInfo
+                         (nemesis/validate! :compose [:power-off])))]
+      (is (= :invalid-nemesis (:lite/error (ex-data e))))
+      (is (str/includes? (ex-message e) "FUSE"))
+      (is (str/includes? (ex-message e) ":local-process")
+          "and says where a power-off can be done instead"))))
 
 (deftest partition-is-possible-here-and-nowhere-else
   ;; The point of the axis, in one assertion: a fault is available where Lite

@@ -113,8 +113,15 @@
           (is (str/includes? msg "doesn't run"))
           (is (str/includes? msg "fix:"))
           (is (str/includes? msg "without a nemesis"))
-          ;; and where the fault the user asked for is possible instead
-          (is (str/includes? msg ":compose")))))))
+          (testing "and names somewhere the fault the user asked for is possible"
+            ;; Whichever target-types those are -- :compose for a partition,
+            ;; :local-process for a power-off. Asking for one particular name
+            ;; would only be asserting today's table back at itself.
+            (let [elsewhere (->> nemesis/validity
+                                 (keep (fn [[target-type row]]
+                                         (when (get row intent) target-type))))]
+              (is (seq elsewhere) (str "nowhere can inject " intent))
+              (is (some #(str/includes? msg (str %)) elsewhere)))))))))
 
 (deftest a-nemesis-is-refused-before-the-target-is-even-reached
   ;; Note the URL: nothing is listening there. Validation is static -- it never

@@ -37,6 +37,7 @@
             [clojure.string :as str]
             [clojure.tools.logging :refer [info warn]]
             [lite.client :as client]
+            [lite.lazyfs :as lazyfs]
             [lite.target :as target]
             [lite.target.endpoint :as endpoint])
   (:import (java.io File)
@@ -138,11 +139,16 @@
                        :pid         pid})))
     pid))
 
-(defrecord LocalProcess [adapter config process conn paused crashes
-                         lifecycle-lock shutdown-hook]
+(defrecord LocalProcess [adapter config lazyfs-config lazyfs process conn
+                         paused crashes lifecycle-lock shutdown-hook]
   target/Lifecycle
   (start! [_this]
     (locking lifecycle-lock
+      ;; The filesystem first, then the target on top of it: the process has to
+      ;; open its data directory *through* lazyfs, or its writes never pass the
+      ;; layer that a power-off clears.
+      (when (and lazyfs-config (not @lazyfs))
+        (reset! lazyfs (lazyfs/mount! lazyfs-config)))
       (when-not @process
         (let [proc (launch! config)]
           (reset! process proc)
@@ -174,6 +180,10 @@
         (reset! process nil))
       (when-let [c (first (reset-vals! conn nil))]
         (client/close adapter c))
+      ;; The filesystem goes last, after the process that was using it. A FUSE
+      ;; mount left behind would outlive the run and break the next one.
+      (when-let [handle (first (reset-vals! lazyfs nil))]
+        (lazyfs/quiesce! handle))
       nil))
 
   target/Connection
@@ -206,10 +216,15 @@
     (.setDaemon true)
     (.start)))
 
-(defn crash!
-  "A real crash: SIGKILL, then start it again.
+(defn- kill-and-restart!
+  "SIGKILL, start it again, wait until it can serve, reconnect.
 
-   No chance to flush, close a file, or run a shutdown hook -- whatever the
+   `before-kill!` runs first, while the target is still alive, and is the only
+   thing that differs between a crash and a power-off. Everything after it --
+   the kill, the restart, the readiness wait, the fresh connection -- is the
+   same sequence, and is shared rather than written twice.
+
+   No chance to flush, close a file, or run a shutdown hook: whatever the
    target hadn't got onto disk is gone, and whether that costs it any
    acknowledged writes is the question the run is asking. Ops that land while
    it is down get a connection error and are recorded honestly by the wrapper:
@@ -218,8 +233,10 @@
    The new connection is published before the old one is closed, so there is
    never a moment with no connection at all -- ops in the window should meet a
    dead target, which is the truth, rather than a nil one."
-  [{:keys [adapter config process conn paused crashes lifecycle-lock]}]
+  [{:keys [adapter config process conn paused crashes lifecycle-lock]} what
+   before-kill!]
   (locking lifecycle-lock
+    (when before-kill! (before-kill!))
     (let [^Process old @process]
       (when old
         (.destroyForcibly old)
@@ -232,10 +249,45 @@
               [stale _]  (reset-vals! conn fresh)]
           (when stale (release-later! adapter stale)))
         (let [n (swap! crashes inc)]
-          (info "Killed the target and started it again"
-                (str "(" n " so far; pid " (when old (.pid old)) " -> "
-                     (.pid proc) ")"))
+          (info what (str "(" n " so far; pid " (when old (.pid old)) " -> "
+                          (.pid proc) ")"))
           n)))))
+
+(defn crash!
+  "A real crash: SIGKILL, then start it again.
+
+   What it does *not* test is fsync. SIGKILL kills the process, not the kernel,
+   so writes the target handed to the OS are written back regardless and
+   survive -- which means a target that fsyncs and one that merely writes come
+   through this identically. `power-off!` is the one that tells them apart."
+  [target]
+  (kill-and-restart! target "Killed the target and started it again" nil))
+
+(defn power-off!
+  "Power loss: throw away everything the target never fsynced, then SIGKILL,
+   then start it again.
+
+   The clear happens while the target is still running and is *awaited* before
+   the kill. Doing it the other way round -- or not waiting -- would leave what
+   the power-off actually dropped undefined, and an undefined fault proves
+   nothing about durability.
+
+   The restarted target re-attaches to a data directory that has lost exactly
+   the writes it never made durable, and has to recover from there. A target
+   that fsyncs what it acknowledges comes back whole; one that acknowledges
+   first and syncs later does not, and the checker says so."
+  [{:keys [lazyfs] :as target}]
+  (let [handle @lazyfs]
+    (when-not handle
+      (throw (ex-info (str "This target has no lazyfs mount, so there is "
+                           "nothing to power off.\n\n"
+                           "  why: power-off drops the writes a target never "
+                           "fsynced, which only lazyfs can see. Lite mounts it "
+                           "for a run that asks for :power-off.")
+                      {:lite/error  :power-off-unavailable
+                       :target-type :local-process})))
+    (kill-and-restart! target "Powered the target off and started it again"
+                       #(lazyfs/clear-cache! handle))))
 
 (defn pause!
   "SIGSTOP: the process stays alive and keeps its port, and stops answering.
@@ -303,8 +355,54 @@
                      :target-type :local-process
                      :dir         dir}))))
 
+(defn- validate-lazyfs-config!
+  [{:keys [mount-point root] :as lazyfs-config}]
+  (when lazyfs-config
+    (when-not (and (string? mount-point) (string? root))
+      (throw (ex-info (str "A :lazyfs mount needs a :mount-point and a :root."
+                           "\n\n"
+                           "  fix: e.g.\n\n"
+                           "    :lazyfs {:dir         \"/opt/lazyfs/lazyfs\"\n"
+                           "             :mount-point \"/tmp/target/data\"\n"
+                           "             :root        \"/tmp/target/root\"}\n\n"
+                           "  note: the target's own data directory has to be"
+                           " the mount point, or somewhere under it. A target"
+                           " writing anywhere else never passes through lazyfs,"
+                           " and every power-off would then pass while dropping"
+                           " nothing.")
+                      {:lite/error  :invalid-target
+                       :target-type :local-process
+                       :lazyfs      lazyfs-config})))))
+
+(defmethod target/verify-faults! :local-process [target intents]
+  (when (some #{:power-off} intents)
+    (let [lazyfs-config (:lazyfs target)]
+      (when-let [reason (lazyfs/unavailable (:dir lazyfs-config))]
+        (throw (ex-info (str ":power-off can't run on this host.\n\n"
+                             "  why: " reason "\n\n"
+                             "  fix: run in a Linux environment with lazyfs"
+                             " built and /dev/fuse available -- a VM or"
+                             " container such as OrbStack Ubuntu, or CI -- and"
+                             " point :target {:lazyfs {:dir ...}} at the"
+                             " built checkout.\n\n"
+                             "  note: Lite won't quietly fall back to :crash"
+                             " here. A plain crash can't drop unfsynced writes,"
+                             " so it would report durability it never tested.")
+                        {:lite/error  :power-off-unavailable
+                         :target-type :local-process
+                         :os          (System/getProperty "os.name")})))
+      (when-not (:mount-point lazyfs-config)
+        (throw (ex-info (str ":power-off needs the target's data directory on "
+                             "a lazyfs mount, and this target has none.\n\n"
+                             "  fix: add :lazyfs {:dir ..., :mount-point ...,"
+                             " :root ...} to the target, and start the target"
+                             " with its data directory at the mount point.")
+                        {:lite/error  :power-off-unavailable
+                         :target-type :local-process}))))))
+
 (defmethod target/build :local-process [target adapter]
   (validate-config! target)
+  (validate-lazyfs-config! (:lazyfs target))
   (map->LocalProcess
    {:adapter        adapter
     ;; The address is parsed now, not at start: a typo in :url should be a
@@ -314,6 +412,8 @@
                            :address (when (:url target)
                                       (endpoint/address :local-process
                                                         (:url target))))
+    :lazyfs-config  (:lazyfs target)
+    :lazyfs         (atom nil)
     :process        (atom nil)
     :conn           (atom nil)
     :paused         (atom false)
