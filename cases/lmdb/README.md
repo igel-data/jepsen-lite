@@ -64,10 +64,9 @@ LMDB in a process Jepsen Lite owns, while `--fault crash`, `--fault pause`, or
 rather than an addition to `crash`: it clears lazyfs's cache and then kills.
 
 Exits non-zero if any workload's verdict is `:valid? false`. Histories and
-results are written under `store/` in Jepsen's normal layout; the environments
-the runs are made against are under `jepsen-data/`, wiped fresh before each one
-— a crash test means nothing if what it recovers turns out to be the previous
-run's.
+results are written under `store/` in Jepsen's normal layout. Each environment
+is created in a unique directory under `jepsen-data/`; an existing directory is
+never deleted or reused, and a crash cannot recover the previous run's state.
 
 | workload | checks | LMDB feature exercised |
 |---|---|---|

@@ -10,7 +10,8 @@
    Nothing here decides what is correct. It reports what happened, as precisely
    as it can, and the checkers rule."
   (:require [clojure.edn :as edn]
-            [lite.client :as client :refer [fail! info!]])
+            [lite.client :as client :refer [fail! info!]]
+            [lite.handlers :as handlers])
   (:import (java.io IOException)
            (java.net ConnectException URI)
            (java.net.http HttpClient HttpRequest HttpRequest$BodyPublishers
@@ -92,78 +93,46 @@
       (<= 400 status 499) (fail! (:error parsed))
       :else               (info! {:status status, :error (:error parsed)}))))
 
-(defrecord Adapter [handler url request-timeout
-                    refusal-threshold refusal-backoff-ms]
-  client/ClientAdapter
-  (open [_]
-    ;; A client against the running driver. Note what is absent: nothing is
-    ;; created, started or seeded here. The database was on disk before this
-    ;; connection existed -- which is what makes reopening it after a crash a
-    ;; question worth asking.
-    {:url     url
-     :timeout (or request-timeout default-request-timeout)
-     :consecutive-refusals (atom 0)
-     :refusal-threshold    (or refusal-threshold default-refusal-threshold)
-     :refusal-backoff-ms   (or refusal-backoff-ms default-refusal-backoff-ms)
-     :client  (-> (HttpClient/newBuilder)
-                  (.connectTimeout (Duration/ofSeconds 2))
-                  (.build))})
-
-  (invoke [_ conn op]
-    (client/complete handler conn op))
-
-  (close [_ conn]
-    ;; Tolerate a nil or already-closed conn: `close` is re-runnable.
-    (when-let [c (:client conn)]
-      (when (instance? java.lang.AutoCloseable c)
-        (.close ^java.lang.AutoCloseable c)))))
+(defn adapter
+  "An adapter which connects to the SQLite driver's HTTP API."
+  [{:keys [url request-timeout refusal-threshold refusal-backoff-ms]}]
+  (client/adapter
+   {:open
+    (fn []
+      {:url     url
+       :timeout (or request-timeout default-request-timeout)
+       :consecutive-refusals (atom 0)
+       :refusal-threshold    (or refusal-threshold default-refusal-threshold)
+       :refusal-backoff-ms   (or refusal-backoff-ms default-refusal-backoff-ms)
+       :client  (-> (HttpClient/newBuilder)
+                    (.connectTimeout (Duration/ofSeconds 2))
+                    (.build))})
+    :close
+    (fn [conn]
+      (when-let [c (:client conn)]
+        (when (instance? java.lang.AutoCloseable c)
+          (.close ^java.lang.AutoCloseable c))))}))
 
 ;; ---- handlers --------------------------------------------------------------
 ;;
 ;; Each returns what the workload's checker reads off the completed op, which is
 ;; not always what the driver hands back -- see `:counter` and `:register`.
 
-(defn- register-handler
-  [conn {:keys [f key value]}]
-  (case f
-    :read  (post conn "/register/read" {:key key})
-    :write (do (post conn "/register/write" {:key key, :value value})
-               value)
-    :cas   (let [[old new] value]
-             ;; A mismatch comes back 409 and `post` calls fail! -- an ordinary
-             ;; failed op, not a violation. On success return the pair the op
-             ;; carried: Knossos's model reads `[old new]` off the completed op.
-             (post conn "/register/cas" {:key key, :old old, :new new})
-             value)))
-
-(defn- set-handler
-  [conn {:keys [f value]}]
-  (case f
-    :add  (post conn "/set/add" {:element value})
-    :read (or (post conn "/set/read" {}) [])))
-
-(defn- counter-handler
-  [conn {:keys [f value]}]
-  (case f
-    ;; Return the increment, not the running total the driver hands back: the
-    ;; checker sums the amounts on the completed ops.
-    :add  (do (post conn "/counter/add" {:amount value})
-              value)
-    :read (long (or (post conn "/counter/read" {}) 0))))
-
-(defn- bank-handler
-  [conn {:keys [f value]}]
-  (case f
-    ;; The opening balances, from the workload's first phase, over the wire like
-    ;; any other op. The handler doesn't know they are special, and SQLite
-    ;; doesn't know it is a bank.
-    :init     (post conn "/bank/init" {:balances value})
-    :read     (post conn "/bank/read" {})
-    :transfer (post conn "/bank/transfer" value)))
-
 (def handlers
   "Workload -> the handler that speaks HTTP for it."
-  {:register register-handler
-   :bank     bank-handler
-   :set      set-handler
-   :counter  counter-handler})
+  {:register (handlers/register
+              {:read #(post %1 "/register/read" {:key %2})
+               :write #(post %1 "/register/write" {:key %2, :value %3})
+               :cas #(post %1 "/register/cas"
+                           {:key %2, :old %3, :new %4})})
+   :bank     (handlers/bank
+              {:init #(post %1 "/bank/init" {:balances %2})
+               :read #(post % "/bank/read" {})
+               :transfer #(post %1 "/bank/transfer"
+                                {:from %2, :to %3, :amount %4})})
+   :set      (handlers/set
+              {:add #(post %1 "/set/add" {:element %2})
+               :read #(post % "/set/read" {})})
+   :counter  (handlers/counter
+              {:add #(post %1 "/counter/add" {:amount %2})
+               :read #(post % "/counter/read" {})})})

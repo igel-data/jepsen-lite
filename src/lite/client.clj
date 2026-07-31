@@ -11,9 +11,8 @@
 (defprotocol ClientAdapter
   "Binds Jepsen Lite to one target protocol.
 
-   `open` and `close` must be idempotent / safely re-runnable: they are called
-   repeatedly over a run (a later milestone implements the crash nemesis as
-   close -> open)."
+   `open` and `close` must be idempotent / safely re-runnable: they may be
+   called repeatedly over a run, including close -> open during a crash."
   (open [this]
     "Establishes a connection / instance and returns the conn handle.")
   (invoke [this conn op]
@@ -77,3 +76,40 @@
         :fail (assoc op :type :fail, :error (:lite/detail (ex-data t)))
         :info (assoc op :type :info, :error (:lite/detail (ex-data t)))
         (assoc op :type :info, :error (unexpected-error t))))))
+
+;; ## Functional adapter
+
+(defrecord FunctionalAdapter [handler open-fn close-fn]
+  ClientAdapter
+  (open [_]
+    (open-fn))
+
+  (invoke [_ conn op]
+    (complete handler conn op))
+
+  (close [_ conn]
+    ;; Nil is the only lifecycle edge Lite can make harmless on the user's
+    ;; behalf. A repeated non-nil close still reaches `close-fn`, whose resource
+    ;; may already have been closed; like every ClientAdapter close, it must be
+    ;; safe to call again.
+    (when conn
+      (close-fn conn))))
+
+(defn adapter
+  "Builds a ClientAdapter from connection lifecycle functions:
+
+     (adapter {:open  (fn [] ...)
+               :close (fn [conn] ...)})
+
+   The workload handler is attached later from the run config, exactly as it is
+   for a record implementing ClientAdapter directly. `:close` is optional for a
+   connection that needs no teardown. For a custom `invoke` implementation,
+   implement ClientAdapter directly instead."
+  [{:keys [open close] :as spec}]
+  (when-not (fn? open)
+    (throw (ex-info "lite.client/adapter needs an :open function of no arguments."
+                    {:lite/error :invalid-adapter, :spec spec})))
+  (when (and (some? close) (not (fn? close)))
+    (throw (ex-info "lite.client/adapter's :close must be a function of [conn]."
+                    {:lite/error :invalid-adapter, :spec spec})))
+  (->FunctionalAdapter nil open (or close (constantly nil))))

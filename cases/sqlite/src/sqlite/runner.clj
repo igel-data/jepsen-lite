@@ -36,36 +36,12 @@
    SIGKILL kills the process, not the page cache. That needs power loss or a
    filesystem fault injector, and no amount of `synchronous = FULL` here proves
    anything about it. See the README."
-  (:require [clojure.java.io :as jio]
+  (:require [lite.resource :as resource]
             [sqlite.client :as client]
             [sqlite.in-process :as in-process])
-  (:import (java.io File)
-           (java.net ServerSocket)))
+  (:import (java.io File)))
 
 (def ^:private all-workloads [:bank :register :set :counter])
-
-(defn- free-port []
-  (with-open [socket (ServerSocket. 0)]
-    (.getLocalPort socket)))
-
-(defn- rm-rf [f]
-  (let [f (jio/file f)]
-    (when (.isDirectory f) (doseq [c (.listFiles f)] (rm-rf c)))
-    (.delete f)))
-
-(defn- fresh-dir!
-  "A clean data directory for one run, before anything starts. That is this
-   namespace's job, not jepsen-lite's -- and a crash test means nothing if the
-   data it is meant to recover turns out to be the last run's."
-  [nm]
-  (let [dir (jio/file "./jepsen-data/" nm)]
-    (rm-rf dir)
-    (.mkdirs dir)
-    ;; Canonical, not just absolute. A power-off mounts lazyfs here and then
-    ;; confirms it by looking for the mount point in `mount`, which reports the
-    ;; path the kernel resolved -- so a "./" left in the middle of ours would
-    ;; never match, and the run would fail with lazyfs mounted and working.
-    (.getCanonicalPath dir)))
 
 ;; ---- in-process ------------------------------------------------------------
 
@@ -78,8 +54,8 @@
      :concurrency  how many workers issue ops
      :journal      SQLite journal mode -- \"wal\" (default) or \"delete\""
   [workload {:keys [nemesis time-limit concurrency journal]}]
-  (let [dir (fresh-dir! (name workload))]
-    (cond-> {:adapter  (in-process/map->Adapter
+  (let [dir (resource/run-dir! "./jepsen-data" (name workload))]
+    (cond-> {:adapter  (in-process/adapter
                         {:db-file (str dir File/separator "sqlite.db")
                          :journal (or journal "wal")})
              :handler  (get in-process/handlers workload)
@@ -138,13 +114,15 @@
         ;; config with a different fault FIFO and every clear-cache goes
         ;; nowhere. jepsen-lite has a fallback for this; not walking into it is
         ;; cheaper than relying on it.
-        base     (fresh-dir! (str (if powering-off? "poweroff-" "kill-")
-                                  (name workload)))
+        base     (resource/run-dir!
+                  "./jepsen-data"
+                  (str (if powering-off? "poweroff-" "kill-")
+                       (name workload)))
         data-dir (if powering-off? (str base File/separator "data") base)
-        port     (free-port)
+        port     (resource/free-port)
         url      (str "http://127.0.0.1:" port)]
-    (.mkdirs (jio/file data-dir))
-    (cond-> {:adapter  (client/map->Adapter {:url url})
+    (resource/ensure-dir! data-dir)
+    (cond-> {:adapter  (client/adapter {:url url})
              :handler  (get client/handlers workload)
              :workload workload
              :name     (str "sqlite-" (if powering-off? "poweroff-" "kill-")

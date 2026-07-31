@@ -28,6 +28,7 @@
    guessed at: `lmdb.db` checks before it touches LMDB, so it knows they did not
    happen."
   (:require [lite.client :as client]
+            [lite.handlers :as handlers]
             [lmdb.db :as db]))
 
 ;; ---- outcomes --------------------------------------------------------------
@@ -54,71 +55,32 @@
 
 ;; ---- the adapter -----------------------------------------------------------
 
-(defrecord Adapter [handler dir sync?]
-  client/ClientAdapter
-  (open [_]
-    ;; Opens the environment on a fixed directory. Note what is absent: nothing
-    ;; is created or reset here beyond the named databases. The data on disk is
-    ;; the durable store, and it survives a close/reopen -- which is exactly
-    ;; what the crash nemesis does. jepsen-lite keeps at most one conn live at a
-    ;; time, so there are never two environments on one directory.
-    (db/open-env! dir {:sync? sync?}))
-
-  (invoke [_ conn op]
-    (client/complete handler conn op))
-
-  (close [_ conn]
-    (when conn (db/close-env! conn))))
+(defn adapter
+  "An adapter which opens and recovers one fixed LMDB environment."
+  [{:keys [dir sync?]}]
+  (client/adapter
+   {:open  #(db/open-env! dir {:sync? sync?})
+    :close db/close-env!}))
 
 ;; ---- handlers --------------------------------------------------------------
 ;;
 ;; Each returns what the workload's checker reads off the completed op, which is
 ;; not always what LMDB hands back -- see `:counter` and `:register`.
 
-(defn- register-handler
-  [store {:keys [f key value]}]
-  (case f
-    :read  (db/register-read store key)
-    :write (do (db/register-write store key value)
-               value)
-    :cas   (let [[old new] value]
-             ;; A mismatch is a `reject!`, which `signalling` turns into an
-             ;; ordinary failed op rather than a violation. On success return
-             ;; the pair the op carried: Knossos's model reads `[old new]` off
-             ;; the completed op.
-             (db/register-cas store key old new)
-             value)))
-
-(defn- set-handler
-  [store {:keys [f value]}]
-  (case f
-    :add  (db/set-add store value)
-    :read (db/set-read store)))
-
-(defn- counter-handler
-  [store {:keys [f value]}]
-  (case f
-    ;; Return the increment, not the running total LMDB hands back: the checker
-    ;; sums the amounts on the completed ops.
-    :add  (do (db/counter-add store value)
-              value)
-    :read (long (db/counter-read store))))
-
-(defn- bank-handler
-  [store {:keys [f value]}]
-  (case f
-    ;; The opening balances, from the workload's first phase, through the same
-    ;; handler as every other op. The handler doesn't know they are special, and
-    ;; LMDB doesn't know it is a bank.
-    :init     (db/bank-init store value)
-    :read     (db/bank-read store)
-    :transfer (let [{:keys [from to amount]} value]
-                (db/bank-transfer store from to amount))))
-
 (def handlers
   "Workload -> the handler that calls LMDB directly for it."
-  (update-vals {:register register-handler
-                :bank     bank-handler
-                :set      set-handler
-                :counter  counter-handler}
+  (update-vals {:register (handlers/register
+                           {:read db/register-read
+                            :write db/register-write
+                            :cas db/register-cas})
+                :bank     (handlers/bank
+                           {:init db/bank-init
+                            :read db/bank-read
+                            :transfer db/bank-transfer})
+                :set      (handlers/set
+                           {:add db/set-add
+                            :read db/set-read})
+                :counter  (handlers/counter
+                           {:add db/counter-add
+                            :read db/counter-read})}
                signalling))

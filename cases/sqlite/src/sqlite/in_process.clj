@@ -26,6 +26,7 @@
    Ops that land in the moment between the close and the open find no instance
    and are recorded as `:info`, which is the honest answer."
   (:require [lite.client :as client]
+            [lite.handlers :as handlers]
             [sqlite.db :as db]))
 
 ;; ---- outcomes --------------------------------------------------------------
@@ -52,71 +53,32 @@
 
 ;; ---- the adapter -----------------------------------------------------------
 
-(defrecord Adapter [handler db-file journal]
-  client/ClientAdapter
-  (open [_]
-    ;; Opens (recovers) the database from a fixed file. Note what is absent:
-    ;; nothing is created or reset here beyond `CREATE TABLE IF NOT EXISTS`.
-    ;; The data on disk is the durable store, and it survives a close/reopen --
-    ;; which is exactly what the crash nemesis does. jepsen-lite keeps at most
-    ;; one conn live at a time, so there are never two pools on one file.
-    (db/open-pool! db-file {:journal (or journal "WAL")}))
-
-  (invoke [_ conn op]
-    (client/complete handler conn op))
-
-  (close [_ conn]
-    (when conn (db/close-pool! conn))))
+(defn adapter
+  "An adapter which opens and recovers one fixed SQLite database file."
+  [{:keys [db-file journal]}]
+  (client/adapter
+   {:open  #(db/open-pool! db-file {:journal (or journal "WAL")})
+    :close db/close-pool!}))
 
 ;; ---- handlers --------------------------------------------------------------
 ;;
 ;; Each returns what the workload's checker reads off the completed op, which is
 ;; not always what SQLite hands back -- see `:counter` and `:register`.
 
-(defn- register-handler
-  [pool {:keys [f key value]}]
-  (case f
-    :read  (db/register-read pool key)
-    :write (do (db/register-write pool key value)
-               value)
-    :cas   (let [[old new] value]
-             ;; A mismatch is a `reject!`, which `signalling` turns into an
-             ;; ordinary failed op rather than a violation. On success return
-             ;; the pair the op carried: Knossos's model reads `[old new]` off
-             ;; the completed op.
-             (db/register-cas pool key old new)
-             value)))
-
-(defn- set-handler
-  [pool {:keys [f value]}]
-  (case f
-    :add  (db/set-add pool value)
-    :read (db/set-read pool)))
-
-(defn- counter-handler
-  [pool {:keys [f value]}]
-  (case f
-    ;; Return the increment, not the running total SQLite hands back: the
-    ;; checker sums the amounts on the completed ops.
-    :add  (do (db/counter-add pool value)
-              value)
-    :read (long (db/counter-read pool))))
-
-(defn- bank-handler
-  [pool {:keys [f value]}]
-  (case f
-    ;; The opening balances, from the workload's first phase, through the same
-    ;; handler as every other op. The handler doesn't know they are special, and
-    ;; SQLite doesn't know it is a bank.
-    :init     (db/bank-init pool value)
-    :read     (db/bank-read pool)
-    :transfer (let [{:keys [from to amount]} value]
-                (db/bank-transfer pool from to amount))))
-
 (def handlers
   "Workload -> the handler that calls SQLite directly for it."
-  (update-vals {:register register-handler
-                :bank     bank-handler
-                :set      set-handler
-                :counter  counter-handler}
+  (update-vals {:register (handlers/register
+                           {:read db/register-read
+                            :write db/register-write
+                            :cas db/register-cas})
+                :bank     (handlers/bank
+                           {:init db/bank-init
+                            :read db/bank-read
+                            :transfer db/bank-transfer})
+                :set      (handlers/set
+                           {:add db/set-add
+                            :read db/set-read})
+                :counter  (handlers/counter
+                           {:add db/counter-add
+                            :read db/counter-read})}
                signalling))

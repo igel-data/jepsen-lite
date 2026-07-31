@@ -48,3 +48,23 @@
     (swap! (client/open a) assoc :k 42)
     (client/close a (client/open a))
     (is (= 42 (:k @(client/open a))))))
+
+(deftest a-functional-adapter-supplies-the-common-invoke-path
+  (let [opened (atom 0)
+        closed (atom [])
+        a      (client/adapter
+                {:open  (fn [] (swap! opened inc))
+                 :close (fn [conn] (swap! closed conj conn))})
+        a      (assoc a :handler (fn [conn op] (+ conn (:value op))))
+        conn   (client/open a)]
+    (is (= 1 conn))
+    (is (= {:type :ok, :f :add, :value 3}
+           (client/invoke a conn {:type :invoke, :f :add, :value 2})))
+    (client/close a conn)
+    (client/close a nil)
+    (is (= [1] @closed))))
+
+(deftest a-functional-adapter-validates-its-functions
+  (is (thrown? clojure.lang.ExceptionInfo (client/adapter {})))
+  (is (thrown? clojure.lang.ExceptionInfo
+               (client/adapter {:open (fn [] nil), :close :nope}))))

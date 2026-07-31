@@ -14,7 +14,7 @@ Two orthogonal axes:
 2. **target-type** — `:in-process` / `:local-process` / `:http` / `:compose`;
    the deploy / lifecycle method, which decides what faults can be injected.
 
-## Status: M7.1 — reusable suite runner
+## Status: M7.2 — reusable suite and authoring helpers
 
 The pipeline runs end to end: a workload's generator → the user's ClientAdapter
 (bridged to `jepsen.client/Client` internally) → a `jepsen.history` → the
@@ -274,6 +274,50 @@ target is deployed; a fault says what Lite should do to it. `--help` includes
 the suite's own typed options. SQLite and LMDB under `cases/` are complete
 examples.
 
+## Write target operations, not Jepsen ops
+
+The direct handler API remains `(fn [conn op] ...)`, but the built-in workload
+constructors unpack those ops and preserve the values their checkers expect:
+
+```clojure
+(require '[lite.client :as client]
+         '[lite.handlers :as handlers]
+         '[lite.resource :as resource])
+
+(def workload-handlers
+  {:register
+   (handlers/register
+    {:read  my-db/read
+     :write my-db/write!
+     :cas   my-db/compare-and-set!})
+
+   :set
+   (handlers/set
+    {:read my-db/read-elements
+     :add  my-db/add-element!})})
+
+(defn config [workload _opts]
+  (let [dir (resource/run-dir! "jepsen-data" workload)]
+    {:adapter  (client/adapter
+                {:open  #(my-db/open dir)
+                 :close my-db/close})
+     :handler  (get workload-handlers workload)
+     :workload workload
+     :target   {:type :in-process}}))
+```
+
+`handlers/register` accepts ordinary `read`, `write`, and CAS functions;
+`handlers/set`, `handlers/counter`, and `handlers/bank` do the same for their
+operation sets. A CAS function can call `lite.client/fail!` itself or return
+`false` for a mismatch. Target-specific rejected and indeterminate outcomes
+still use `fail!` and `info!` explicitly—the helper does not guess whether an
+exception means an operation happened.
+
+`client/adapter` covers the common open/complete/close lifecycle. Targets that
+need custom invocation behavior can still implement `ClientAdapter` directly.
+`resource/run-dir!` creates a unique directory without deleting an existing
+one, and `resource/free-port` supplies a port for a local driver process.
+
 ## Verifying a real store
 
 The reason the project exists: point a lightweight harness at a persistent
@@ -309,10 +353,11 @@ fixtures in `test/` and never reads `examples/`.
     clojure -M:test                                   # everything but Docker
     JEPSEN_LITE_DOCKER=1 clojure -M:test -n lite.compose-docker-test
 
-A user writes a **ClientAdapter**, a **handler**, and picks a `:workload`;
-`lite.core/run` returns `{:valid? ..., :results ..., :history ...}`. Each
-workload documents its handler contract in its own namespace — see
-`lite.workload.register`.
+A user supplies connection lifecycle functions (or a custom
+**ClientAdapter**), target operation functions (or a direct **handler**), and
+picks a `:workload`; `lite.core/run` returns
+`{:valid? ..., :results ..., :history ...}`. Each workload documents its full
+handler contract in its own namespace — see `lite.workload.register`.
 
 Handlers signal outcomes by throwing: return normally for `:ok`, call
 `(lite.client/fail! msg)` for a certain failure, `(lite.client/info! reason)` for
