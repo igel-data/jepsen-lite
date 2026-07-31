@@ -28,6 +28,10 @@
   :run-compose {:extra-paths ["examples"]
                 :main-opts   ["-m" "demo.compose-kvs"]}
 
+  ;; Creates a small, runnable consumer project. The generated suite delegates
+  ;; its CLI to lite.runner and leaves only target operations to replace.
+  :new {:main-opts ["-m" "lite.scaffold"]}
+
   ;; Build and publish the library jar. `clojure -T:build jar`, and
   ;; `clojure -T:build install` to put it in the local ~/.m2 to try against a
   ;; consumer. Releasing is the release workflow's job, from a tag.

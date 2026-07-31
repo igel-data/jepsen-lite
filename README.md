@@ -14,7 +14,7 @@ Two orthogonal axes:
 2. **target-type** — `:in-process` / `:local-process` / `:http` / `:compose`;
    the deploy / lifecycle method, which decides what faults can be injected.
 
-## Status: M7.2 — reusable suite and authoring helpers
+## Status: M7.3 — runnable test scaffolds
 
 The pipeline runs end to end: a workload's generator → the user's ClientAdapter
 (bridged to `jepsen.client/Client` internally) → a `jepsen.history` → the
@@ -273,6 +273,33 @@ Workloads, profiles and faults are separate choices: a profile says how the
 target is deployed; a fault says what Lite should do to it. `--help` includes
 the suite's own typed options. SQLite and LMDB under `cases/` are complete
 examples.
+
+## Start a new test
+
+From a Jepsen Lite checkout, generate a small consumer project:
+
+```sh
+clojure -M:new my-store
+cd my-store
+clojure -M:jepsen --help
+clojure -M:jepsen --time-limit 5
+```
+
+The generated register test is runnable immediately. It contains a target file
+with five ordinary functions to replace—connection open/close plus register
+read/write/CAS—and a declarative suite. It does not generate a `-main`, argument
+parser, or duplicated workload dispatch.
+
+Pass a destination as the second argument when it should not be `./my-store`:
+
+```sh
+clojure -M:new my-store ../verification/my-store
+```
+
+The generator refuses to write to an existing path. By default the consumer's
+dependency points back to the current working copy of Jepsen Lite. To generate
+a Maven dependency after a release, use
+`clojure -M:new --lite-version VERSION my-store`.
 
 ## Write target operations, not Jepsen ops
 
