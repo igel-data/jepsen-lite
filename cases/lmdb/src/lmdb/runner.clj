@@ -20,20 +20,18 @@
      :counter   read-modify-write in a write transaction.
      :set       durability of acknowledged writes.
 
-   Run:  clojure -M:jepsen                    ; all four, in-process, no faults
-         clojure -M:jepsen bank               ; one workload
-         clojure -M:jepsen set crash          ; in-process: close + reopen
-         clojure -M:jepsen set kill           ; a real kill -9
-         clojure -M:jepsen counter pause      ; SIGSTOP / SIGCONT
-         clojure -M:jepsen bank time=30 concurrency=8
-         clojure -M:jepsen set kill sync=off  ; MDB_NOSYNC -- see the README
+   Run:  clojure -M:jepsen
+         clojure -M:jepsen --workload bank
+         clojure -M:jepsen --workload set --fault crash
+         clojure -M:jepsen --profile process --workload set --fault crash
+         clojure -M:jepsen --profile process --workload counter --fault pause
+         clojure -M:jepsen --workload bank --time-limit 30 --concurrency 8
+         clojure -M:jepsen --profile process --workload set --sync off
 
    What neither shape tests is loss of writes the OS took but never flushed:
    SIGKILL kills the process, not the page cache. That needs power loss or a
    filesystem fault injector. See the README."
   (:require [clojure.java.io :as jio]
-            [clojure.string :as str]
-            [lite.core :as core]
             [lmdb.client :as client]
             [lmdb.in-process :as in-process])
   (:import (java.io File)
@@ -178,68 +176,23 @@
       ;; against or the faults land after the workload has finished.
       true        (assoc :time-limit (or time-limit (if nemesis 20 5))))))
 
-;; ---- the runner ------------------------------------------------------------
+;; ---- the suite -------------------------------------------------------------
 
-(defn run-workload
-  "Runs one workload and returns jepsen-lite's verdict map."
-  [workload {:keys [kill?] :as opts}]
-  (println (str "\n==== " (name workload)
-                (when kill? " (separate process)")
-                (when (seq (:nemesis opts))
-                  (str " " (str/join " " (map name (:nemesis opts)))))
-                (when (false? (:sync? opts)) " nosync")
-                " ===="))
-  (core/run (if kill?
-              (kill-config workload opts)
-              (config workload opts))))
-
-(defn- parse-args
-  "Words in any order: workload names (default: all four), `crash`, `kill`,
-   `pause`, `power-off`, and `<key>=<value>` for time, concurrency, sync and
-   lazyfs.
-
-   `kill`, `pause` and `power-off` all mean a separate process, because none of
-   them is possible against an object in jepsen-lite's own JVM: there is nothing
-   for the kernel to signal and nowhere to put a filesystem. `kill` means the
-   fault too -- a separate process with nothing killing it would just be a
-   slower in-process run -- and `power-off` is its own fault, not an addition
-   to `crash`: it clears lazyfs's cache and *then* kills."
-  [args]
-  (let [flags    (set (remove #(str/includes? % "=") args))
-        settings (into {} (map #(str/split % #"=" 2))
-                       (filter #(str/includes? % "=") args))
-        chosen   (filterv (comp flags name) all-workloads)
-        kill?    (boolean (some flags ["kill" "pause" "power-off"]))
-        intents  (cond-> []
-                   (some flags ["crash" "kill"]) (conj :crash)
-                   (flags "power-off")           (conj :power-off)
-                   (flags "pause")               (conj :pause))]
-    [(if (seq chosen) chosen all-workloads)
-     (cond-> {}
-       kill?                        (assoc :kill? true)
-       (seq intents)                (assoc :nemesis intents)
-       (get settings "time")        (assoc :time-limit
-                                           (parse-long (get settings "time")))
-       (get settings "concurrency") (assoc :concurrency
-                                           (parse-long (get settings "concurrency")))
-       (= "off" (get settings "sync")) (assoc :sync? false)
-       (get settings "lazyfs")      (assoc :lazyfs-dir (get settings "lazyfs")))]))
-
-(defn -main
-  "clojure -M:jepsen [workload...] [crash] [kill] [pause] [power-off]
-                     [time=n] [concurrency=n] [sync=on|off]
-                     [lazyfs=/path/to/lazyfs/lazyfs]"
-  [& args]
-  (let [[workloads opts] (parse-args args)
-        results (doall (for [w workloads]
-                         [w (:valid? (run-workload w opts))]))]
-    (println "\n==== summary ====")
-    (doseq [[w valid?] results]
-      (println (format "  %-10s :valid? %s" (name w) (pr-str valid?))))
-    (shutdown-agents)
-    ;; Only `true` is a pass. A checker can also answer `:unknown` -- the `:set`
-    ;; workload does when its final read never completed, which is what a store
-    ;; that cannot be reopened at all looks like -- and `:unknown` is truthy in
-    ;; Clojure, so testing it for truth would report a run that reached no
-    ;; verdict as a success.
-    (System/exit (if (every? (comp true? second) results) 0 1))))
+(def suite
+  "The target-specific part of the test. `lite.runner` owns the CLI, workload
+   repetition, summary and exit status; these two builders keep the deployment
+   details here with LMDB."
+  {:name              "lmdb"
+   :workloads         all-workloads
+   :default-workloads :all
+   :default-profile   :in-process
+   :profiles
+   {:in-process {:build config}
+    :process    {:build kill-config}}
+   :options
+   {:sync   {:values ["on" "off"]
+             :parse #(not= "off" %)
+             :key :sync?
+             :doc "LMDB sync mode"}
+    :lazyfs {:key :lazyfs-dir
+             :doc "path to the lazyfs executable"}}})

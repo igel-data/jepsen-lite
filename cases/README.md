@@ -17,7 +17,7 @@ Run one from its own directory:
 
 ```sh
 cd cases/sqlite && clojure -M:jepsen
-cd cases/lmdb   && clojure -M:jepsen set kill
+cd cases/lmdb   && clojure -M:jepsen --profile process --workload set --fault crash
 ```
 
 Because the dependency is the working copy rather than a release, a change to
@@ -51,9 +51,9 @@ shared way to get there from anywhere else — a Linux box with lazyfs built, pl
 the native libraries the individual cases bind to:
 
 ```sh
-cases/power-off sqlite set power-off           # fsyncs  -> survives
-cases/power-off sqlite set power-off sync=off  # doesn't -> loses writes
-cases/power-off lmdb   set power-off sync=off  # MDB_NOSYNC, same story
+cases/power-off sqlite --profile process --workload set --fault power-off
+cases/power-off sqlite --profile process --workload set --fault power-off --sync off
+cases/power-off lmdb   --profile process --workload set --fault power-off --sync off
 ```
 
 Each case carries the measured contrast in its own README. In short: at

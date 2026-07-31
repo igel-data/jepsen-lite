@@ -14,7 +14,7 @@ Two orthogonal axes:
 2. **target-type** — `:in-process` / `:local-process` / `:http` / `:compose`;
    the deploy / lifecycle method, which decides what faults can be injected.
 
-## Status: M6 — v1 complete
+## Status: M7.1 — reusable suite runner
 
 The pipeline runs end to end: a workload's generator → the user's ClientAdapter
 (bridged to `jepsen.client/Client` internally) → a `jepsen.history` → the
@@ -224,6 +224,55 @@ Whatever initial state a workload needs, the workload writes itself, through the
 same handler as every other op — `:bank` opens its accounts with an `:init` op
 in a first generator phase. Adapters stay workload-agnostic, and initialization
 doesn't silently re-run on every crash.
+
+## One runner for a target's test suite
+
+`lite.core/run` remains the direct API for one config. A target with several
+workloads or deployment shapes can instead declare a suite and use Lite's
+common CLI:
+
+```clojure
+(def suite
+  {:name              "my-store"
+   :workloads         [:bank :register :set :counter]
+   :default-workloads :all
+   :default-profile   :in-process
+   :profiles
+   {:in-process {:build config}
+    :process    {:build kill-config}}
+   :options
+   {:sync   {:values ["on" "off"]
+             :parse #(not= "off" %)
+             :key :sync?
+             :doc "store sync mode"}
+    :lazyfs {:key :lazyfs-dir
+             :doc "path to the lazyfs executable"}}})
+```
+
+Each profile's `:build` is an ordinary
+`(fn [workload opts] <lite.core/run config>)`. The target still owns its
+adapter, handlers, process command and target-specific defaults; Lite owns
+argument parsing, workload repetition, summary output and exit status.
+
+Point an alias at the suite var:
+
+```clojure
+:main-opts ["-m" "lite.runner" "my-store.runner/suite"]
+```
+
+Then every suite has the same command line:
+
+```sh
+clojure -M:jepsen --list
+clojure -M:jepsen --workload bank
+clojure -M:jepsen --profile process --workload set --fault crash
+clojure -M:jepsen --profile process --workload set --fault power-off --sync off
+```
+
+Workloads, profiles and faults are separate choices: a profile says how the
+target is deployed; a fault says what Lite should do to it. `--help` includes
+the suite's own typed options. SQLite and LMDB under `cases/` are complete
+examples.
 
 ## Verifying a real store
 

@@ -2,15 +2,16 @@
 #
 # Runs a store's suite inside the lazyfs container, for the :power-off nemesis.
 #
-#   cases/power-off sqlite set power-off
-#   cases/power-off lmdb   set power-off sync=off
-#   cases/power-off sqlite bank power-off time=30 concurrency=8
+#   cases/power-off sqlite --profile process --workload set --fault power-off
+#   cases/power-off lmdb   --profile process --workload set --fault power-off --sync off
+#   cases/power-off sqlite --profile process --workload bank --fault power-off --time-limit 30 --concurrency 8
 #
 # The first argument is the case; the rest go to `clojure -M:jepsen` unchanged,
 # so anything the runner accepts works here too.
 #
-# Every other fault runs natively -- `cd cases/sqlite && clojure -M:jepsen set
-# kill`. This wrapper exists only because lazyfs is FUSE, and FUSE means Linux.
+# Every other fault runs natively -- `cd cases/sqlite && clojure -M:jepsen
+# --profile process --workload set --fault crash`. This wrapper exists only
+# because lazyfs is FUSE, and FUSE means Linux.
 #
 # --device /dev/fuse and --cap-add SYS_ADMIN are what let a FUSE filesystem be
 # mounted inside the container; without them lazyfs cannot start, and Jepsen
@@ -25,7 +26,7 @@ REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 
 if [ $# -lt 1 ]; then
     echo "usage: cases/power-off <case> [args...]" >&2
-    echo "   e.g. cases/power-off lmdb set power-off" >&2
+    echo "   e.g. cases/power-off lmdb --profile process --workload set --fault power-off" >&2
     exit 2
 fi
 

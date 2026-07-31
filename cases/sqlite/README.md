@@ -22,33 +22,33 @@ drift apart.
 ## Run
 
 ```sh
-clojure -M:jepsen                          # bank + register + set + counter
-clojure -M:jepsen bank                     # one workload
-clojure -M:jepsen set crash                # in-process: close + reopen
-clojure -M:jepsen set kill                 # a real kill -9
-clojure -M:jepsen counter pause            # SIGSTOP / SIGCONT
-clojure -M:jepsen bank time=30 concurrency=8
-clojure -M:jepsen set kill journal=delete  # rollback journal instead of WAL
+clojure -M:jepsen
+clojure -M:jepsen --workload bank
+clojure -M:jepsen --workload set --fault crash
+clojure -M:jepsen --profile process --workload set --fault crash
+clojure -M:jepsen --profile process --workload counter --fault pause
+clojure -M:jepsen --workload bank --time-limit 30 --concurrency 8
+clojure -M:jepsen --profile process --workload set --journal delete
 ```
 
 And the fault a `kill -9` cannot be — on Linux, with lazyfs, from the repository root:
 
 ```sh
-cases/power-off sqlite set power-off           # synchronous=FULL -> survives
-cases/power-off sqlite set power-off sync=off  # doesn't fsync    -> loses writes
-cases/power-off sqlite set kill     sync=off   # same store       -> and passes
+cases/power-off sqlite --profile process --workload set --fault power-off
+cases/power-off sqlite --profile process --workload set --fault power-off --sync off
+cases/power-off sqlite --profile process --workload set --fault crash --sync off
 ```
 
 `cases/power-off` runs the case inside a container with lazyfs and `/dev/fuse`,
-because FUSE means Linux. On a Linux host, `clojure -M:jepsen set power-off`
-works directly once `JEPSEN_LITE_LAZYFS` points at a built lazyfs checkout.
+because FUSE means Linux. On a Linux host the same
+`--profile process --fault power-off` command works directly once
+`JEPSEN_LITE_LAZYFS` points at a built lazyfs checkout.
 
-Words go in any order. `kill`, `pause` and `power-off` all imply the separate
-process, because none of them is possible against an object in Jepsen Lite's own
-JVM — there is nothing for the kernel to signal, and nowhere to put a filesystem
-underneath. `kill` implies the fault too, since a separate process with nothing
-killing it would just be a slower in-process run. `power-off` is its own fault
-rather than an addition to `crash`: it clears lazyfs's cache and *then* kills.
+The deployment and the fault are separate choices: `--profile process` puts
+SQLite in a process Jepsen Lite owns, while `--fault crash`, `--fault pause`,
+or `--fault power-off` says what should happen to it. `power-off` is its own
+fault rather than an addition to `crash`: it clears lazyfs's cache and then
+kills.
 
 Exits non-zero if any workload's verdict is `:valid? false`. Histories and
 results are written under `store/` in Jepsen's normal layout; the databases the
