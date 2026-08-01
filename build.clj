@@ -20,6 +20,16 @@
 (defn clean [_]
   (b/delete {:path "target"}))
 
+(defn- write-version!
+  "Records the version being built, so the code can name itself.
+
+   `lite.scaffold` needs it: a generated project has to depend on *this*
+   Jepsen Lite, and a jar has no other way to know which release it is."
+  []
+  (let [file (b/resolve-path (str class-dir "/lite/version.edn"))]
+    (b/write-file {:path (str file)
+                   :string (pr-str {:lib (str lib), :version version})})))
+
 (defn jar [_]
   (clean nil)
   (b/write-pom {:class-dir class-dir
@@ -45,6 +55,7 @@
                             [:tag (str "v" version)]]]})
   (b/copy-dir {:src-dirs   ["src"]
                :target-dir class-dir})
+  (write-version!)
   (b/copy-file {:src    "LICENSE"
                 :target (str class-dir "/META-INF/LICENSE")})
   (b/jar {:class-dir class-dir

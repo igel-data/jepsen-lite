@@ -21,7 +21,8 @@
    CLI, repetition, summary and exit status without introducing a second config
    language."
   (:require [clojure.string :as str]
-            [lite.core :as core]))
+            [lite.core :as core]
+            [lite.nemesis :as nemesis]))
 
 (def ^:private faults
   [:crash :pause :partition :power-off])
@@ -29,6 +30,16 @@
 (def ^:private reserved-options
   #{"--workload" "--all-workloads" "--profile" "--fault"
     "--time-limit" "--concurrency" "--list" "--help"})
+
+(def ^:private reserved-keys
+  "Keys the runner itself puts into a profile's build options. A suite option
+   claiming one of these would be silently overwritten by the common flag that
+   owns it, which is a bug a user would only find by wondering why their value
+   never arrived."
+  #{:nemesis :time-limit :concurrency})
+
+(def ^:private reserved-key-options
+  {:nemesis "--fault", :time-limit "--time-limit", :concurrency "--concurrency"})
 
 (defn- invalid!
   [message data]
@@ -63,7 +74,14 @@
     (when-not (fn? (:build spec))
       (invalid! (str "Profile " (pr-str profile)
                      " needs a :build function of [workload opts].")
-                {:field :profiles, :profile profile, :value spec})))
+                {:field :profiles, :profile profile, :value spec}))
+    (when-let [target-type (:target-type spec)]
+      (when-not (contains? nemesis/validity target-type)
+        (invalid! (str "Profile " (pr-str profile) " has an unknown "
+                       ":target-type " (pr-str target-type) ".\n\n"
+                       "Available target-types: "
+                       (comma-list (sort (keys nemesis/validity))))
+                  {:field :profiles, :profile profile, :value target-type}))))
   (when-not (contains? profiles default-profile)
     (invalid! (str "The suite's :default-profile " (pr-str default-profile)
                    " is not present in :profiles.")
@@ -102,6 +120,14 @@
       (invalid! (str "Suite option " (pr-str option)
                      " has a :key value that is not a keyword.")
                 {:field :options, :option option, :value (:key spec)}))
+    (when (contains? reserved-keys (or (:key spec) option))
+      (let [key (or (:key spec) option)]
+        (invalid! (str "Suite option " (pr-str option)
+                       " would be passed to the profile as " (pr-str key)
+                       ", which the runner already fills in from "
+                       (get reserved-key-options key) ".\n\n"
+                       "  fix: give the option a different :key.")
+                  {:field :options, :option option, :value (:key spec)})))
     (let [long-name (or (:long spec)
                         (str "--" (clojure.core/name option)))]
       (when-not (and (string? long-name) (str/starts-with? long-name "--"))
@@ -164,8 +190,15 @@
   (reduce-kv
    (fn [parsed option spec]
      (if (contains? spec :default)
-       (assoc parsed (or (:key spec) option)
-              (parse-custom-value option spec (str (:default spec))))
+       (let [value (:default spec)]
+         (assoc parsed (or (:key spec) option)
+                ;; A string default is what the command line would have
+                ;; supplied, so it goes through the same checking and parsing.
+                ;; Anything else is already the value the suite meant, and
+                ;; stringifying it would quietly turn `true` into "true".
+                (if (string? value)
+                  (parse-custom-value option spec value)
+                  value)))
        parsed))
    {}
    (:options suite)))
@@ -280,6 +313,16 @@
 (defn- suite-title [suite]
   (display-name (:name suite)))
 
+(defn- profile-faults
+  "The faults a profile can take, or nil if it hasn't said which target-type
+   it deploys."
+  [suite profile]
+  (when-let [target-type (get-in suite [:profiles profile :target-type])]
+    (->> (get nemesis/validity target-type)
+         (keep (fn [[fault ok?]] (when ok? fault)))
+         sort
+         vec)))
+
 (defn help
   "Returns the generated help text for `suite`."
   [suite]
@@ -306,6 +349,17 @@
      "  --help                show this help\n\n"
      "Workloads: " (comma-list (:workloads suite)) "\n"
      "Profiles:  " (comma-list (keys (:profiles suite))) "\n"
+     ;; Which faults a profile can take depends on how it deploys the target,
+     ;; so a profile that says which target-type it is gets to advertise them.
+     ;; Offering every fault to every profile invites asking for one that can
+     ;; never work.
+     (apply str
+            (for [profile (keys (:profiles suite))
+                  :let [possible (profile-faults suite profile)]
+                  :when possible]
+              (format "  %-16s faults: %s\n"
+                      (display-name profile)
+                      (if (seq possible) (comma-list possible) "none"))))
      "Default profile: " (display-name (:default-profile suite)) "\n")))
 
 (defn listing
@@ -324,6 +378,67 @@
     time-limit   (assoc :time-limit time-limit)
     concurrency  (assoc :concurrency concurrency)))
 
+(defn- check-faults!
+  "Refuses a fault the chosen profile cannot inject, before anything runs.
+
+   A profile that declares its `:target-type` gets this answer here rather than
+   from the middle of the first run. Without one, `lite.core/run` still refuses
+   the combination -- just later, and after a banner has been printed."
+  [suite {:keys [profile faults]}]
+  (when-let [target-type (get-in suite [:profiles profile :target-type])]
+    (doseq [fault faults]
+      (when-not (get-in nemesis/validity [target-type fault])
+        ;; Lite's own wording, so a user meets one explanation of a fault's
+        ;; limits and not two.
+        (nemesis/validate! target-type [fault])))))
+
+(defn- completed-faults
+  "Fault intents whose nemesis ops completed successfully.
+
+   An invocation alone proves only that Jepsen scheduled a fault. `:resume` is
+   cleanup for `:pause`, not evidence that a pause happened."
+  [history]
+  (let [fault-set (set faults)]
+    (into #{}
+          (keep (fn [op]
+                  (when (and (= :nemesis (:process op))
+                             (#{:ok :info} (:type op))
+                             (contains? fault-set (:f op)))
+                    (:f op))))
+          history)))
+
+(defn- check-faults-happened!
+  "A run that was asked for faults and produced none did not test what it
+   says it tested.
+
+   The usual cause is a profile's `:build` dropping the options it was handed,
+   so `:nemesis` never reaches `lite.core/run`. The verdict is then a green
+   result for a fault nobody injected, which is worse than a failure."
+  [{:keys [faults]} workload result]
+  (when (and (seq faults)
+             ;; Only judge a run that produced a history to judge. A real one
+             ;; always does; anything else is a caller standing in for
+             ;; `lite.core/run`, and silence is the honest answer there.
+             (contains? result :history))
+    (let [completed (completed-faults (:history result))
+          missing   (vec (remove completed faults))]
+      (when (seq missing)
+        (invalid!
+         (str "Asked for " (comma-list faults) " on " (name workload)
+              ", but "
+              (if (= (count missing) (count faults))
+                "no fault was injected"
+                (str (comma-list missing) " was not injected"))
+              ".\n\n"
+              "  why: the run's history has no completed nemesis operation for "
+              (comma-list missing) ", so this verdict says nothing about "
+              (comma-list missing) ".\n\n"
+              "  fix: check that the profile's :build passes its `opts` through "
+              "to the run config -- `:nemesis` in particular. A build that "
+              "ignores its second argument silently drops every fault asked "
+              "for on the command line.")
+         {:workload workload, :faults faults, :missing-faults missing})))))
+
 (defn- run-one
   [suite request workload]
   (let [profile (:profile request)
@@ -335,6 +450,7 @@
                     (str " " (str/join " " (map name (:faults request)))))
                   " ===="))
     (let [result (core/run (build workload opts))]
+      (check-faults-happened! request workload result)
       {:profile  profile
        :workload workload
        :faults   (:faults request)
@@ -350,7 +466,11 @@
              (name profile)
              (name workload)
              (if (seq faults) (str/join "," (map name faults)) "-")
-             (pr-str valid?)))))
+             (pr-str valid?))))
+  (doseq [{:keys [workload error]} rows
+          :when error]
+    (println (str "\n  " (name workload) " did not finish:\n\n"
+                  (str/replace error #"(?m)^" "    ")))))
 
 (defn run-suite
   "Parses `args`, runs the selected suite entries, prints their summary, and
@@ -364,12 +484,31 @@
                 {:exit-code 0, :action :help, :runs []})
       :list (do (print (listing suite))
                 {:exit-code 0, :action :list, :runs []})
-      :run  (let [rows (mapv #(run-one suite request %)
-                             (:workloads request))]
-              (print-summary! suite rows)
-              {:exit-code (if (every? (comp true? :valid?) rows) 0 1)
-               :action    :run
-               :runs      rows}))))
+      :run  (do
+              ;; Everything that can be known before running is settled first,
+              ;; so an impossible combination costs nothing and a long suite
+              ;; doesn't discover it on its last workload.
+              (check-faults! suite request)
+              (let [rows (mapv (fn [workload]
+                                 ;; One workload failing is not a reason to
+                                 ;; throw away the results of the ones that
+                                 ;; already ran -- an eight-workload suite
+                                 ;; shouldn't lose seven verdicts because a
+                                 ;; target wouldn't start for the eighth.
+                                 (try
+                                   (run-one suite request workload)
+                                   (catch Exception t
+                                     {:profile  (:profile request)
+                                      :workload workload
+                                      :faults   (:faults request)
+                                      :valid?   :error
+                                      :error    (ex-message t)
+                                      :thrown   t})))
+                               (:workloads request))]
+                (print-summary! suite rows)
+                {:exit-code (if (every? (comp true? :valid?) rows) 0 1)
+                 :action    :run
+                 :runs      rows})))))
 
 (defn resolve-suite
   "Requires and dereferences a suite var named by `suite-ref`, such as

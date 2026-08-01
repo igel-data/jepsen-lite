@@ -1,6 +1,7 @@
 (ns lite.scaffold
   "Creates a minimal, runnable Jepsen Lite consumer project."
-  (:require [clojure.java.io :as io]
+  (:require [clojure.edn :as edn]
+            [clojure.java.io :as io]
             [clojure.string :as str])
   (:import (java.nio.file Path)))
 
@@ -9,6 +10,23 @@
 
 (defn- invalid! [message data]
   (throw (ex-info message (assoc data :lite/error :invalid-scaffold-input))))
+
+(defn released-version
+  "The Jepsen Lite version this code was built as, or nil when it is running
+   from a source checkout.
+
+   `build.clj` writes it into the jar. It is what lets a generated project
+   depend on the same Jepsen Lite that generated it, rather than on wherever
+   the user happened to be standing."
+  []
+  (some-> (io/resource "lite/version.edn") slurp edn/read-string :version))
+
+(defn- lite-checkout?
+  "Does `dir` look like a Jepsen Lite source checkout?"
+  [dir]
+  (let [root (io/file dir)]
+    (and (.isFile (io/file root "deps.edn"))
+         (.isFile (io/file root "src/lite/core.clj")))))
 
 (defn- namespace-path [project]
   (-> project
@@ -20,17 +38,41 @@
         ^Path to   (.toPath (io/file to))]
     (str (.relativize (.toAbsolutePath from) (.toAbsolutePath to)))))
 
-(defn- dependency-edn [{:keys [lite-root lite-version]} output]
-  (if lite-version
-    (binding [*print-namespace-maps* false]
-      (pr-str {:mvn/version lite-version}))
-    (let [root (io/file lite-root)]
-      (when-not (and (.isFile (io/file root "deps.edn"))
-                     (.isFile (io/file root "src/lite/core.clj")))
-        (invalid! (str "Jepsen Lite was not found at " lite-root ".")
-                  {:field :lite-root, :value lite-root}))
-      (binding [*print-namespace-maps* false]
-        (pr-str {:local/root (relative-path output root)})))))
+(defn- dependency-edn
+  "What the generated project should depend on.
+
+   In order: an explicit `:lite-version`, then an explicit `:lite-root`, then
+   whichever this Jepsen Lite is -- a release names its own version, and a
+   working copy points back at itself. The last step is what makes
+   `clojure -M:new` work both from a checkout and from the released jar,
+   without the user having to know which they are running."
+  [{:keys [lite-root lite-version]} output]
+  (binding [*print-namespace-maps* false]
+    (cond
+      lite-version
+      (pr-str {:mvn/version lite-version})
+
+      lite-root
+      (do (when-not (lite-checkout? lite-root)
+            (invalid! (str "Jepsen Lite was not found at " lite-root ".")
+                      {:field :lite-root, :value lite-root}))
+          (pr-str {:local/root (relative-path output lite-root)}))
+
+      (released-version)
+      (pr-str {:mvn/version (released-version)})
+
+      (lite-checkout? (System/getProperty "user.dir"))
+      (pr-str {:local/root (relative-path output (System/getProperty "user.dir"))})
+
+      :else
+      (invalid!
+       (str "Can't tell which Jepsen Lite this project should depend on.\n\n"
+            "  why: this copy of Jepsen Lite carries no version (so it isn't a"
+            " release), and the current directory isn't a Jepsen Lite"
+            " checkout.\n\n"
+            "  fix: pass --lite-version VERSION for a released one, or"
+            " --lite-root PATH for a working copy.")
+       {:field :lite-version, :value nil}))))
 
 (defn- deps-template [project dependency]
   (format
@@ -92,11 +134,19 @@
    "(ns %s.runner
   (:require [%s.target :as target]))
 
-(defn config [workload _opts]
-  {:adapter  (target/adapter)
-   :handler  (get target/handlers workload)
-   :workload workload
-   :target   {:type :in-process}})
+;; `opts` carries what the command line asked for. Pass it on: a run that
+;; quietly dropped `--fault` would report a green verdict for a fault nobody
+;; injected, which is worse than no test at all.
+(defn config [workload {:keys [nemesis time-limit concurrency]}]
+  (cond-> {:adapter  (target/adapter)
+           :handler  (get target/handlers workload)
+           :workload workload
+           :target   {:type :in-process}}
+    nemesis     (assoc :nemesis nemesis)
+    concurrency (assoc :concurrency concurrency)
+    ;; A fault needs a clock to land inside: without one an in-memory target
+    ;; finishes its ops before the first crash arrives.
+    (or time-limit nemesis) (assoc :time-limit (or time-limit 10))))
 
 ;; lite.runner owns -main, argument parsing, repetition, summaries, and exit
 ;; status. This project declares only what differs for its target.
@@ -105,7 +155,9 @@
    :workloads         [:register]
    :default-workloads :register
    :default-profile   :in-process
-   :profiles          {:in-process {:build config}}})
+   ;; :target-type lets the runner say which faults this profile can take, and
+   ;; refuse the others before anything runs.
+   :profiles          {:in-process {:build config, :target-type :in-process}}})
 "
    project project project))
 
@@ -159,12 +211,11 @@ suite's `:workloads`.
 (defn create!
   "Creates a starter project and returns its canonical directory.
 
-   Required: `:name`. `:output` defaults to the name. By default the generated
-   dependency points to `:lite-root` (the current directory); pass
-   `:lite-version` to generate a Maven dependency instead. Existing output is
-   never overwritten."
-  [{:keys [name output lite-root lite-version]
-    :or {lite-root (System/getProperty "user.dir")}}]
+   Required: `:name`. `:output` defaults to the name. The generated dependency
+   is on this Jepsen Lite -- its released version when running from a jar, or
+   this working copy when running from a checkout; `:lite-version` and
+   `:lite-root` override that. Existing output is never overwritten."
+  [{:keys [name output lite-root lite-version]}]
   (when-not (and (string? name) (re-matches project-pattern name))
     (invalid! "Project name must be lowercase kebab-case, optionally namespaced with dots."
               {:field :name, :value name}))
@@ -184,7 +235,7 @@ suite's `:workloads`.
                     (str "test/" source-dir "/target_test.clj")
                     (test-template name)
                     "README.md" (readme-template name)
-                    ".gitignore" "/.cpcache\n/store\n"}]
+                    ".gitignore" "/.cpcache\n/store\n/jepsen-data\n"}]
     (when (.exists output)
       (invalid! (str "Refusing to overwrite existing path " output ".")
                 {:field :output, :value (.getPath output)}))
@@ -201,8 +252,11 @@ suite's `:workloads`.
   (str "Create a runnable Jepsen Lite test project.\n\n"
        "Usage:\n"
        "  clojure -M:new NAME [DIRECTORY]\n"
-       "  clojure -M:new --lite-version VERSION NAME [DIRECTORY]\n\n"
-       "Without --lite-version, the project depends on this working copy."))
+       "  clojure -M:new --lite-version VERSION NAME [DIRECTORY]\n"
+       "  clojure -M:new --lite-root PATH NAME [DIRECTORY]\n\n"
+       "The project depends on this Jepsen Lite: its released version when\n"
+       "run from a release, or this working copy when run from a checkout.\n"
+       "--lite-version and --lite-root override that."))
 
 (defn- parse-args [args]
   (loop [remaining args, parsed {}]
@@ -214,6 +268,10 @@ suite's `:workloads`.
         (if-let [version (first more)]
           (recur (next more) (assoc parsed :lite-version version))
           (invalid! "--lite-version needs a value." {:option arg}))
+        (= "--lite-root" arg)
+        (if-let [root (first more)]
+          (recur (next more) (assoc parsed :lite-root root))
+          (invalid! "--lite-root needs a value." {:option arg}))
         (str/starts-with? arg "-")
         (invalid! (str "Unknown option " arg ".") {:option arg})
         (nil? (:name parsed)) (recur more (assoc parsed :name arg))

@@ -13,6 +13,40 @@
       (doseq [child (.listFiles file)] (delete-tree! child)))
     (.delete file)))
 
+(defn- temp-root []
+  (.toFile (Files/createTempDirectory "jepsen-lite-scaffold-test"
+                                      (make-array FileAttribute 0))))
+
+(deftest the-generated-suite-honours-the-command-line
+  ;; The generated project's README tells a newcomer to run `--time-limit 5`,
+  ;; and its help offers `--fault`. If the generated `config` dropped the opts
+  ;; it was handed, both would be accepted and ignored -- and a run asked for a
+  ;; crash would report a green verdict having crashed nothing. This loads the
+  ;; generated code and asks it directly.
+  (let [root (temp-root)
+        out  (io/file root "honours")]
+    (try
+      (scaffold/create! {:name "honours", :output out
+                         :lite-root (System/getProperty "user.dir")})
+      (load-file (.getPath (io/file out "src/honours/target.clj")))
+      (load-file (.getPath (io/file out "src/honours/runner.clj")))
+      (let [config (resolve 'honours.runner/config)
+            built  (config :register {:nemesis     [:crash]
+                                      :time-limit  7
+                                      :concurrency 3})]
+        (is (= [:crash] (:nemesis built)) "--fault reaches the run config")
+        (is (= 7 (:time-limit built))     "--time-limit reaches the run config")
+        (is (= 3 (:concurrency built))    "--concurrency reaches the run config")
+
+        (testing "and the suite declares what its profile can be asked for"
+          (let [suite (var-get (resolve 'honours.runner/suite))]
+            (is (= :in-process
+                   (get-in suite [:profiles :in-process :target-type]))))))
+      (finally
+        (remove-ns 'honours.runner)
+        (remove-ns 'honours.target)
+        (delete-tree! root)))))
+
 (deftest creates-a-complete-project-without-overwriting
   (let [root (.toFile (Files/createTempDirectory
                        "jepsen-lite-scaffold-test"

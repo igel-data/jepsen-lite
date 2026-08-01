@@ -238,8 +238,8 @@ common CLI:
    :default-workloads :all
    :default-profile   :in-process
    :profiles
-   {:in-process {:build config}
-    :process    {:build kill-config}}
+   {:in-process {:build config,      :target-type :in-process}
+    :process    {:build kill-config, :target-type :local-process}}
    :options
    {:sync   {:values ["on" "off"]
              :parse #(not= "off" %)
@@ -253,6 +253,13 @@ Each profile's `:build` is an ordinary
 `(fn [workload opts] <lite.core/run config>)`. The target still owns its
 adapter, handlers, process command and target-specific defaults; Lite owns
 argument parsing, workload repetition, summary output and exit status.
+
+**Pass `opts` on.** `:nemesis`, `:time-limit` and `:concurrency` arrive there,
+and a `:build` that ignores them accepts `--fault crash` and runs no crash at
+all. The runner refuses such a run rather than reporting its verdict: a green
+result for a fault nobody injected is worse than a failure. A profile that
+names its `:target-type` also gets its impossible faults refused before
+anything starts, and `--help` then lists what each profile can actually take.
 
 Point an alias at the suite var:
 
@@ -276,14 +283,21 @@ examples.
 
 ## Start a new test
 
-From a Jepsen Lite checkout, generate a small consumer project:
+Generate a small consumer project — from a checkout with `clojure -M:new`, or
+from the released library anywhere:
 
 ```sh
-clojure -M:new my-store
+clojure -Sdeps '{:deps {com.igel-data/jepsen-lite {:mvn/version "VERSION"}}}' \
+  -M -m lite.scaffold my-store
 cd my-store
 clojure -M:jepsen --help
 clojure -M:jepsen --time-limit 5
+clojure -M:jepsen --fault crash
 ```
+
+The generated project depends on whichever Jepsen Lite generated it: the
+release when run from a release, this working copy when run from a checkout.
+`--lite-version` and `--lite-root` override that.
 
 The generated register test is runnable immediately. It contains a target file
 with five ordinary functions to replace—connection open/close plus register
@@ -296,10 +310,7 @@ Pass a destination as the second argument when it should not be `./my-store`:
 clojure -M:new my-store ../verification/my-store
 ```
 
-The generator refuses to write to an existing path. By default the consumer's
-dependency points back to the current working copy of Jepsen Lite. To generate
-a Maven dependency after a release, use
-`clojure -M:new --lite-version VERSION my-store`.
+The generator refuses to write to an existing path.
 
 ## Write target operations, not Jepsen ops
 
